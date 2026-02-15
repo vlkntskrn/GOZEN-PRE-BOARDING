@@ -1124,59 +1124,59 @@ class _ScanTabState extends State<ScanTab> {
       final tag = result.action == _ScanAction.pre ? PaxTag.pre : PaxTag.dft;
 
       // Seat lock transaction for non-infant
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        if (!isInfant) {
-          final seatDoc = _seatLockDoc(seat);
-          final seatSnap = await tx.get(seatDoc);
-          if (seatSnap.exists) {
-            final d = seatSnap.data() as Map<String, dynamic>;
-            final activePaxId = (d['activePaxId'] ?? '') as String;
-            final active = (d['active'] ?? true) as bool;
-            if (active && activePaxId.isNotEmpty) {
-              throw _SeatDuplicateException(seat);
-            }
-          }
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      // IMPORTANT: Firestore transactions require **all reads** to happen before **any writes**.
+      // So we fetch the documents we need first, then apply writes at the end.
+
+      final seatDoc = sessionRef.collection('seats').doc(seatId);
+      final paxDoc = sessionRef.collection('pax').doc(paxId);
+      final sessionDoc = sessionRef;
+
+      // --- READS (must come first) ---
+      DocumentSnapshot<Map<String, dynamic>>? seatSnap;
+      if (!isInfant) {
+        seatSnap = await tx.get(seatDoc);
+      }
+      final paxSnap = await tx.get(paxDoc);
+      final sessionSnap = await tx.get(sessionDoc);
+
+      // Duplicate seat check (for non-infant)
+      if (!isInfant) {
+        final data = (seatSnap?.data()) ?? <String, dynamic>{};
+        final occupiedBy = (data['occupiedBy'] as String?) ?? '';
+        final occupiedAt = data['occupiedAt'];
+        if (occupiedBy.isNotEmpty) {
+          throw StateError('seat-duplicate: $seatId occupiedBy=$occupiedBy occupiedAt=$occupiedAt');
         }
+      }
 
-        // Upsert pax doc keyed by seat + name hash-ish
-        final pid = sanitizeKey('${seat}_${surname}_${given}'.toUpperCase());
-        final paxDoc = _paxCol.doc(pid);
-        final existing = await tx.get(paxDoc);
+      // Already boarded check
+      final paxData = paxSnap.data() ?? <String, dynamic>{};
+      final status = (paxData['status'] as String?) ?? '';
+      if (status == 'boarded') {
+        throw StateError('already-boarded');
+      }
 
-        if (existing.exists) {
-          final ex = existing.data() as Map<String, dynamic>;
-          final prevStatus = (ex['status'] ?? 'active') as String;
-          if (prevStatus == 'offloaded') {
-            // Re-entry after offload -> warning prompt outside transaction is hard.
-            // We encode state and let UI warn before transaction if needed.
-          }
-        }
+      // Determine if we should set firstPaxAt (only if not set yet)
+      final sessionData = sessionSnap.data() ?? <String, dynamic>{};
+      final hasFirstPax = sessionData.containsKey('firstPaxAt') && sessionData['firstPaxAt'] != null;
 
-        tx.set(
-          paxDoc,
-          Pax(
-            id: pid,
-            flightCode: widget.flightCode,
-            fullName: namePreview,
-            surname: surname,
-            givenName: given,
-            seat: seat,
-            tag: tag,
-            status: PaxStatus.active,
-            isInfant: isInfant,
-            scannedAt: DateTime.now(),
-            lastEvent: 'scanned',
-          ).toMap(),
-          SetOptions(merge: true),
-        );
+      // --- WRITES (must come after reads) ---
+      tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
 
-        if (!isInfant) {
-          tx.set(_seatLockDoc(seat), {
-            'active': true,
-            'activePaxId': pid,
-            'updatedAt': FieldValue.serverTimestamp(),
-          });
-        }
+      if (!isInfant) {
+        tx.set(seatDoc, {
+          'occupiedBy': paxId,
+          'occupiedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
+
+      tx.set(sessionDoc, {
+        'updatedAt': FieldValue.serverTimestamp(),
+        if (!hasFirstPax) 'firstPaxAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    });
+}
 
         // store first/last pax times on session
         final sessionDoc = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
