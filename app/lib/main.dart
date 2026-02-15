@@ -187,10 +187,34 @@ class _Splash extends StatelessWidget {
 // Models
 // -------------------------
 
-enum PaxTag { dft, pre }
+enum PaxTag { dft, pre, infant }
 
 enum PaxStatus { active, offloaded }
 
+
+
+/// String constants used in Firestore for `lastEvent`.
+/// Kept as strings (instead of enum) for backward/forward compatibility.
+class PaxEvent {
+  static const String scanned = 'scanned';
+  static const String pre = 'pre';
+  static const String dft = 'dft';
+  static const String boarded = 'boarded';
+  static const String offloaded = 'offloaded';
+  static const String reinstated = 'reinstated';
+  /// Convenience list for UI dropdowns etc.
+  static const List<String> values = <String>[
+    scanned,
+    pre,
+    dft,
+    boarded,
+    offloaded,
+    reinstated,
+  ];
+
+
+  const PaxEvent._();
+}
 class Pax {
   Pax({
     required this.id,
@@ -204,6 +228,10 @@ class Pax {
     required this.isInfant,
     required this.scannedAt,
     required this.lastEvent,
+    this.lastActorUid,
+    this.lastActorEmail,
+    this.raw,
+    this.source,
   });
 
   final String id;
@@ -217,6 +245,10 @@ class Pax {
   final bool isInfant;
   final DateTime scannedAt;
   final String lastEvent; // scanned/offloaded/reinstated
+  final String? lastActorUid;
+  final String? lastActorEmail;
+  final String? raw;
+  final String? source;
 
   Map<String, dynamic> toMap() {
     return {
@@ -230,12 +262,39 @@ class Pax {
       'isInfant': isInfant,
       'scannedAt': Timestamp.fromDate(scannedAt),
       'lastEvent': lastEvent,
+      'lastActorUid': lastActorUid,
+      'lastActorEmail': lastActorEmail,
+      'raw': raw,
+      'source': source,
       'updatedAt': FieldValue.serverTimestamp(),
     };
   }
 
   static Pax fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
     final d = doc.data() ?? <String, dynamic>{};
+
+    final tagStr = (d['tag'] as String?) ?? 'pre';
+    final tag = PaxTag.values.firstWhere(
+      (e) => e.name == tagStr,
+      orElse: () => PaxTag.pre,
+    );
+
+    final statusStr = (d['status'] as String?) ?? 'active';
+    final status = PaxStatus.values.firstWhere(
+      (e) => e.name == statusStr,
+      orElse: () => PaxStatus.active,
+    );
+
+    final ts = d['scannedAt'];
+    final scannedAt = ts is Timestamp
+        ? ts.toDate()
+        : (ts is int ? DateTime.fromMillisecondsSinceEpoch(ts) : DateTime.now());
+
+    final isInfant = (d['isInfant'] as bool?) ?? (tag == PaxTag.infant);
+
+    final lastEventStr = (d['lastEvent'] as String?) ?? 'pre';
+    final lastEvent = PaxEvent.values.contains(lastEventStr) ? lastEventStr : PaxEvent.pre;
+
     return Pax(
       id: doc.id,
       flightCode: (d['flightCode'] ?? '') as String,
@@ -243,11 +302,15 @@ class Pax {
       surname: (d['surname'] ?? '') as String,
       givenName: (d['givenName'] ?? '') as String,
       seat: (d['seat'] ?? '') as String,
-      tag: ((d['tag'] ?? 'dft') as String) == 'pre' ? PaxTag.pre : PaxTag.dft,
-      status: ((d['status'] ?? 'active') as String) == 'offloaded' ? PaxStatus.offloaded : PaxStatus.active,
-      isInfant: (d['isInfant'] ?? false) as bool,
-      scannedAt: ((d['scannedAt'] as Timestamp?)?.toDate()) ?? DateTime.now(),
-      lastEvent: (d['lastEvent'] ?? 'scanned') as String,
+      tag: tag,
+      status: status,
+      isInfant: isInfant,
+      scannedAt: scannedAt,
+      lastEvent: lastEvent,
+      lastActorUid: (d['lastActorUid'] as String?) ?? '',
+      lastActorEmail: (d['lastActorEmail'] as String?) ?? '',
+      raw: (d['raw'] as String?) ?? '',
+      source: (d['source'] as String?) ?? '',
     );
   }
 }
@@ -1078,125 +1141,168 @@ class _ScanTabState extends State<ScanTab> {
     });
   }
 
+  
+  Map<String, String?>? _parseFromRaw(String raw) {
+    try {
+      return parseBoardingPayload(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String _normalizeSeat(String seat) => normalizeSeat(seat);
+
+  Future<PaxTag?> _pickTypeDialog() async {
+    if (!mounted) return null;
+    return showDialog<PaxTag>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Tip Seç'),
+        content: const Text('Bu yolcu için işlem tipini seçin.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, PaxTag.dft),
+            child: const Text('DFT'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, PaxTag.pre),
+            child: const Text('Pre'),
+          ),
+        ],
+      ),
+    );
+  }
+
+
   Future<void> _handleBarcode(String raw) async {
     if (_busy) return;
-    setState(() {
-      _busy = true;
-      _lastRaw = raw;
-    });
 
+    final parsed = _parseFromRaw(raw);
+    if (parsed == null) {
+      _toast('Biniş kartı formatı okunamadı.');
+      return;
+    }
+
+    final seat = _normalizeSeat((parsed['seat'] ?? '').trim());
+    if (seat.isEmpty) {
+      _toast('Seat okunamadı.');
+      return;
+    }
+
+    final tag = await _pickTypeDialog();
+    if (tag == null) return;
+
+    setState(() => _busy = true);
     try {
-      final parsed = parseBoardingPayload(raw);
-      final flight = (parsed['flightCode'] ?? '').trim();
-      final surname = (parsed['surname'] ?? '').trim();
-      final given = (parsed['givenName'] ?? '').trim();
-      final seat = normalizeSeat(parsed['seat'] ?? '');
+      final user = FirebaseAuth.instance.currentUser;
+      final uid = user?.uid ?? 'unknown';
+      final email = user?.email ?? 'unknown';
 
-      if (seat.isEmpty) {
-        _toast('Seat okunamadi.');
-        return;
-      }
+      final sessionRef = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
+      final paxDoc = _paxCol.doc(); // auto id
+      final seatLockDoc = _seatLockDoc(seat);
 
-      final namePreview = (surname.isEmpty && given.isEmpty) ? '(isim okunamadi)' : '$surname $given'.trim();
-      final flightPreview = flight.isEmpty ? widget.flightCode : flight;
+      final now = DateTime.now();
+      final isInfant =
+          (parsed['infant'] ?? '').toLowerCase() == '1' || (parsed['infant'] ?? '').toLowerCase() == 'true';
 
-      final result = await showModalBottomSheet<_ScanDecision>(
-        context: context,
-        isScrollControlled: true,
-        showDragHandle: true,
-        builder: (ctx) {
-          return _ScanDecisionSheet(
-            flightCode: flightPreview,
-            seat: seat,
-            name: namePreview,
+      // Transaction rule: ALL reads first, then writes.
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        final seatSnap = await tx.get(seatLockDoc);
+        final sessionSnap = await tx.get(sessionRef);
+
+        if (!isInfant && seatSnap.exists) {
+          final data = seatSnap.data();
+          throw _SeatDuplicateException(seat);
+          }
+
+        final surname = (parsed['surname'] ?? '').trim();
+        final given = (parsed['given'] ?? '').trim();
+        final full = (surname.isEmpty && given.isEmpty) ? '' : '$surname/$given';
+
+        final pax = Pax(
+          id: paxDoc.id,
+          flightCode: widget.flightCode,
+          seat: seat,
+          surname: surname,
+          givenName: given,
+          fullName: full,
+          tag: isInfant ? PaxTag.infant : tag,
+          status: PaxStatus.active,
+          isInfant: isInfant,
+          scannedAt: now,
+          lastEvent: PaxEvent.scanned,
+          lastActorUid: uid,
+          lastActorEmail: email,
+          raw: raw,
+          source: 'camera',
+        );
+
+        // Writes (after reads)
+        tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
+
+        // Seat lock only for non-infant (so infant duplicates allowed)
+        if (!isInfant) {
+          tx.set(
+            seatLockDoc,
+            {
+              'seat': seat,
+              'occupiedBy': paxDoc.id,
+              'occupiedAt': Timestamp.fromDate(now),
+              'flightCode': widget.flightCode,
+            },
+            SetOptions(merge: true),
           );
-        },
-      );
-
-      if (result == null) return;
-
-      if (result.action == _ScanAction.offload) {
-        await _offloadBySeat(seat);
-        return;
-      }
-
-      final isInfant = result.isInfant;
-      final tag = result.action == _ScanAction.pre ? PaxTag.pre : PaxTag.dft;
-
-      // Seat lock transaction for non-infant
-    await FirebaseFirestore.instance.runTransaction((tx) async {
-      // IMPORTANT: Firestore transactions require **all reads** to happen before **any writes**.
-      // So we fetch the documents we need first, then apply writes at the end.
-
-      final seatDoc = sessionRef.collection('seats').doc(seatId);
-      final paxDoc = sessionRef.collection('pax').doc(paxId);
-      final sessionDoc = sessionRef;
-
-      // --- READS (must come first) ---
-      DocumentSnapshot<Map<String, dynamic>>? seatSnap;
-      if (!isInfant) {
-        seatSnap = await tx.get(seatDoc);
-      }
-      final paxSnap = await tx.get(paxDoc);
-      final sessionSnap = await tx.get(sessionDoc);
-
-      // Duplicate seat check (for non-infant)
-      if (!isInfant) {
-        final data = (seatSnap?.data()) ?? <String, dynamic>{};
-        final occupiedBy = (data['occupiedBy'] as String?) ?? '';
-        final occupiedAt = data['occupiedAt'];
-        if (occupiedBy.isNotEmpty) {
-          throw StateError('seat-duplicate: $seatId occupiedBy=$occupiedBy occupiedAt=$occupiedAt');
         }
-      }
 
-      // Already boarded check
-      final paxData = paxSnap.data() ?? <String, dynamic>{};
-      final status = (paxData['status'] as String?) ?? '';
-      if (status == 'boarded') {
-        throw StateError('already-boarded');
-      }
-
-      // Determine if we should set firstPaxAt (only if not set yet)
-      final sessionData = sessionSnap.data() ?? <String, dynamic>{};
-      final hasFirstPax = sessionData.containsKey('firstPaxAt') && sessionData['firstPaxAt'] != null;
-
-      // --- WRITES (must come after reads) ---
-      tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
-
-      if (!isInfant) {
-        tx.set(seatDoc, {
-          'occupiedBy': paxId,
-          'occupiedAt': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
-      }
-
-      tx.set(sessionDoc, {
-        'updatedAt': FieldValue.serverTimestamp(),
-        if (!hasFirstPax) 'firstPaxAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-    });
-}
-
-        // store first/last pax times on session
-        final sessionDoc = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
-        final sessionSnap = await tx.get(sessionDoc);
-        final sd = sessionSnap.data() as Map<String, dynamic>?;
-        final first = sd?['firstPaxAt'];
-        final nowTs = Timestamp.fromDate(DateTime.now());
-        if (first == null) {
-          tx.set(sessionDoc, {'firstPaxAt': nowTs}, SetOptions(merge: true));
+        final sData = sessionSnap.data() ?? <String, dynamic>{};
+        if (sData['firstPaxAt'] == null) {
+          tx.set(sessionRef, {'firstPaxAt': Timestamp.fromDate(now)}, SetOptions(merge: true));
         }
-        tx.set(sessionDoc, {'lastPaxAt': nowTs}, SetOptions(merge: true));
+        tx.set(sessionRef, {'lastPaxAt': Timestamp.fromDate(now)}, SetOptions(merge: true));
       });
 
-      _toast('${tag == PaxTag.dft ? 'DFT' : 'Pre'} kaydedildi: $seat');
-    } on _SeatDuplicateException {
-      final proceed = await _confirm('Mükerrer Seat', 'Bu uçuşta aynı seat (infant hariç) olamaz. Yine de eklemek istiyor musun?');
+      _toast('${tag == PaxTag.dft ? 'DFT' : (tag == PaxTag.pre ? 'Pre' : 'INF')} kaydedildi: $seat');
+    } on _SeatDuplicateException catch (e) {
+      final proceed = await _confirm(
+        'Mükerrer Seat',
+        'Bu uçuşta aynı seat (infant hariç) olamaz.\nSeat: ${e.seat}\nDevam edilsin mi? (Infant olarak işaretlenecek)',
+      );
       if (!proceed) return;
-      // Force add by marking as infant? No. Better: allow manual override for supervisors.
-      // We will allow override by saving pax as infant=true (exception path) only if user confirms.
-      await _forceAddAsInfant();
+
+      // Force add as infant (no seat lock)
+      final user = FirebaseAuth.instance.currentUser;
+      final uid = user?.uid ?? 'unknown';
+      final email = user?.email ?? 'unknown';
+      final paxDoc = _paxCol.doc();
+      final now = DateTime.now();
+
+      final surname = (parsed['surname'] ?? '').trim();
+      final given = (parsed['given'] ?? '').trim();
+      final full = (surname.isEmpty && given.isEmpty) ? '' : '$surname/$given';
+
+      final pax = Pax(
+        id: paxDoc.id,
+        flightCode: widget.flightCode,
+        seat: seat,
+        surname: surname,
+        givenName: given,
+        fullName: full,
+        tag: PaxTag.infant,
+        status: PaxStatus.active,
+        isInfant: true,
+        scannedAt: now,
+        lastEvent: PaxEvent.scanned,
+        lastActorUid: uid,
+        lastActorEmail: email,
+        raw: raw,
+        source: 'camera',
+      );
+
+      await paxDoc.set(pax.toMap(), SetOptions(merge: true));
+      _toast('Infant olarak eklendi: $seat');
     } catch (e, st) {
       showOpError(context, e, st);
     } finally {
@@ -1205,7 +1311,8 @@ class _ScanTabState extends State<ScanTab> {
     }
   }
 
-  Future<void> _forceAddAsInfant() async {
+Future<void> _forceAddAsInfant() async {
+    final now = DateTime.now();
     final raw = _lastRaw;
     if (raw == null) return;
     final parsed = parseBoardingPayload(raw);
@@ -1241,7 +1348,7 @@ class _ScanTabState extends State<ScanTab> {
             status: PaxStatus.active,
             isInfant: true,
             scannedAt: DateTime.now(),
-            lastEvent: 'scanned',
+            lastEvent: PaxEvent.scanned,
           ).toMap(),
           SetOptions(merge: true),
         );
