@@ -49,15 +49,52 @@ void showOpError(BuildContext context, Object error, [StackTrace? st]) {
     detail = error.toString();
   }
 
-  debugPrint('GateOps ERROR: $title :: $detail');
-  if (st != null) debugPrint(st.toString());
+  final stackText = st != null ? '\n\nSTACK\n${st.toString()}' : '';
+  final fullText = '${title}\n${detail}${stackText}';
 
-  final text = detail.isNotEmpty ? '$title\n$detail' : title;
+  debugPrint('GateOps ERROR: $fullText');
+
   ScaffoldMessenger.of(context).showSnackBar(
     SnackBar(
-      content: Text(text, maxLines: 3, overflow: TextOverflow.ellipsis),
-      duration: const Duration(seconds: 6),
+      content: Text(
+        fullText,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      duration: const Duration(seconds: 10),
       behavior: SnackBarBehavior.floating,
+      action: SnackBarAction(
+        label: 'DETAY',
+        onPressed: () async {
+          await showDialog<void>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: Text(title),
+              content: SingleChildScrollView(
+                child: SelectableText(fullText),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: fullText));
+                    if (ctx.mounted) {
+                      Navigator.of(ctx).pop();
+                    }
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Kopyalandi')),
+                    );
+                  },
+                  child: const Text('KOPYALA'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('KAPAT'),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
     ),
   );
 }
@@ -2308,4 +2345,3 @@ class _ExportTabState extends State<ExportTab> {
     );
   }
 }
-
