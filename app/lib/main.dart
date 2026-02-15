@@ -1132,8 +1132,9 @@ class _ScanTabState extends State<ScanTab> {
       // We will allow override by saving pax as infant=true (exception path) only if user confirms.
       await _forceAddAsInfant();
     } catch (e) {
-      _toast('Islem hatasi.');
-    } finally {
+     _toast('HATA: $e');
+    }
+    finally {
       if (!mounted) return;
       setState(() => _busy = false);
     }
