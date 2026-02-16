@@ -22,42 +22,60 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 // Web localStorage (Flutter Web için)
-import 'dart:html' as html;
 
-void main() => runApp(const GateOpsRoot());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await AuthStore.init();
+  runApp(const GateOpsRoot());
+}
 
 /* =========================================================
-   AUTH STORAGE (LocalStorage)
+   AUTH STORAGE (SecureStorage)
 ========================================================= */
 
 class AuthStore {
   static const _key = 'gateops_auth_v1';
 
-  static AuthData load() {
+  static const FlutterSecureStorage _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+  );
+
+  static AuthData _cache = AuthData.empty();
+  static bool _inited = false;
+
+  /// Must be called once before runApp().
+  static Future<void> init() async {
+    if (_inited) return;
+    _inited = true;
     try {
-      final raw = html.window.localStorage[_key];
-      if (raw == null || raw.trim().isEmpty) return AuthData.empty();
+      final raw = await _storage.read(key: _key);
+      if (raw == null || raw.trim().isEmpty) {
+        _cache = AuthData.empty();
+        return;
+      }
       final map = jsonDecode(raw) as Map<String, dynamic>;
-      return AuthData.fromJson(map);
+      _cache = AuthData.fromJson(map);
     } catch (_) {
-      return AuthData.empty();
+      _cache = AuthData.empty();
     }
   }
 
+  /// Synchronous access to the last loaded value.
+  static AuthData load() => _cache;
+
   static void save(AuthData data) {
-    try {
-      html.window.localStorage[_key] = jsonEncode(data.toJson());
-    } catch (_) {
-      // ignore in MVP
-    }
+    _cache = data;
+    // Fire-and-forget: persistence failures shouldn't break the app in MVP.
+    _storage.write(key: _key, value: jsonEncode(data.toJson())).catchError((_) {});
   }
 
   static void clearAll() {
-    try {
-      html.window.localStorage.remove(_key);
-    } catch (_) {}
+    _cache = AuthData.empty();
+    _storage.delete(key: _key).catchError((_) {});
   }
 }
 
@@ -130,7 +148,7 @@ class PasswordPolicy {
     final hasUpper = RegExp(r'[A-Z]').hasMatch(pwd);
     final hasLower = RegExp(r'[a-z]').hasMatch(pwd);
     final hasDigit = RegExp(r'\d').hasMatch(pwd);
-    final hasPunct = RegExp(r'''[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/;'`~]''').hasMatch(pwd);
+    final hasPunct = RegExp(r'''[!@#$%^&*(),.?":{}|<>_\-+=\[\]\/;\'"`~]''').hasMatch(pwd);
     return hasUpper && hasLower && hasDigit && hasPunct;
   }
 
