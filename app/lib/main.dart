@@ -130,7 +130,7 @@ class PasswordPolicy {
     final hasUpper = RegExp(r'[A-Z]').hasMatch(pwd);
     final hasLower = RegExp(r'[a-z]').hasMatch(pwd);
     final hasDigit = RegExp(r'\d').hasMatch(pwd);
-    final hasPunct = RegExp(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\/;`~]').hasMatch(pwd);
+    final hasPunct = RegExp(r'''[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\\/;'`~]''').hasMatch(pwd);
     return hasUpper && hasLower && hasDigit && hasPunct;
   }
 
