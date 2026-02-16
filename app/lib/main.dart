@@ -104,6 +104,8 @@ void showOpError(BuildContext context, Object error, [StackTrace? st]) {
 // Theme
 // -------------------------
 
+
+final ValueNotifier<ThemeMode> _appThemeMode = ValueNotifier(ThemeMode.light);
 class GateOpsApp extends StatelessWidget {
   const GateOpsApp({super.key});
 
@@ -134,11 +136,18 @@ class GateOpsApp extends StatelessWidget {
       snackBarTheme: const SnackBarThemeData(behavior: SnackBarBehavior.floating),
     );
 
-    return MaterialApp(
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: _appThemeMode,
+      builder: (context, mode, _) {
+        return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'GateOps',
       theme: theme,
+            darkTheme: ThemeData(useMaterial3: true, colorScheme: ColorScheme.fromSeed(seedColor: red, brightness: Brightness.dark)),
+            themeMode: mode,
       home: const _AuthGate(),
+    );
+      },
     );
   }
 }
@@ -187,34 +196,32 @@ class _Splash extends StatelessWidget {
 // Models
 // -------------------------
 
-enum PaxTag { dft, pre, infant }
+enum PaxTag { dft, pre }
 
 enum PaxStatus { active, offloaded }
 
 
+class _ParsedScan {
+  final String raw;
+  final String flightCode;
+  final String seat;
+  final String surname;
+  final String givenName;
+  final String fullName;
+  final bool isBCBP;
 
-/// String constants used in Firestore for `lastEvent`.
-/// Kept as strings (instead of enum) for backward/forward compatibility.
-class PaxEvent {
-  static const String scanned = 'scanned';
-  static const String pre = 'pre';
-  static const String dft = 'dft';
-  static const String boarded = 'boarded';
-  static const String offloaded = 'offloaded';
-  static const String reinstated = 'reinstated';
-  /// Convenience list for UI dropdowns etc.
-  static const List<String> values = <String>[
-    scanned,
-    pre,
-    dft,
-    boarded,
-    offloaded,
-    reinstated,
-  ];
-
-
-  const PaxEvent._();
+  const _ParsedScan({
+    required this.raw,
+    required this.flightCode,
+    required this.seat,
+    required this.surname,
+    required this.givenName,
+    required this.fullName,
+    required this.isBCBP,
+  });
 }
+
+
 class Pax {
   Pax({
     required this.id,
@@ -228,10 +235,6 @@ class Pax {
     required this.isInfant,
     required this.scannedAt,
     required this.lastEvent,
-    this.lastActorUid,
-    this.lastActorEmail,
-    this.raw,
-    this.source,
   });
 
   final String id;
@@ -245,10 +248,6 @@ class Pax {
   final bool isInfant;
   final DateTime scannedAt;
   final String lastEvent; // scanned/offloaded/reinstated
-  final String? lastActorUid;
-  final String? lastActorEmail;
-  final String? raw;
-  final String? source;
 
   Map<String, dynamic> toMap() {
     return {
@@ -262,39 +261,12 @@ class Pax {
       'isInfant': isInfant,
       'scannedAt': Timestamp.fromDate(scannedAt),
       'lastEvent': lastEvent,
-      'lastActorUid': lastActorUid,
-      'lastActorEmail': lastActorEmail,
-      'raw': raw,
-      'source': source,
       'updatedAt': FieldValue.serverTimestamp(),
     };
   }
 
   static Pax fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
     final d = doc.data() ?? <String, dynamic>{};
-
-    final tagStr = (d['tag'] as String?) ?? 'pre';
-    final tag = PaxTag.values.firstWhere(
-      (e) => e.name == tagStr,
-      orElse: () => PaxTag.pre,
-    );
-
-    final statusStr = (d['status'] as String?) ?? 'active';
-    final status = PaxStatus.values.firstWhere(
-      (e) => e.name == statusStr,
-      orElse: () => PaxStatus.active,
-    );
-
-    final ts = d['scannedAt'];
-    final scannedAt = ts is Timestamp
-        ? ts.toDate()
-        : (ts is int ? DateTime.fromMillisecondsSinceEpoch(ts) : DateTime.now());
-
-    final isInfant = (d['isInfant'] as bool?) ?? (tag == PaxTag.infant);
-
-    final lastEventStr = (d['lastEvent'] as String?) ?? 'pre';
-    final lastEvent = PaxEvent.values.contains(lastEventStr) ? lastEventStr : PaxEvent.pre;
-
     return Pax(
       id: doc.id,
       flightCode: (d['flightCode'] ?? '') as String,
@@ -302,15 +274,11 @@ class Pax {
       surname: (d['surname'] ?? '') as String,
       givenName: (d['givenName'] ?? '') as String,
       seat: (d['seat'] ?? '') as String,
-      tag: tag,
-      status: status,
-      isInfant: isInfant,
-      scannedAt: scannedAt,
-      lastEvent: lastEvent,
-      lastActorUid: (d['lastActorUid'] as String?) ?? '',
-      lastActorEmail: (d['lastActorEmail'] as String?) ?? '',
-      raw: (d['raw'] as String?) ?? '',
-      source: (d['source'] as String?) ?? '',
+      tag: ((d['tag'] ?? 'dft') as String) == 'pre' ? PaxTag.pre : PaxTag.dft,
+      status: ((d['status'] ?? 'active') as String) == 'offloaded' ? PaxStatus.offloaded : PaxStatus.active,
+      isInfant: (d['isInfant'] ?? false) as bool,
+      scannedAt: ((d['scannedAt'] as Timestamp?)?.toDate()) ?? DateTime.now(),
+      lastEvent: (d['lastEvent'] ?? 'scanned') as String,
     );
   }
 }
@@ -697,6 +665,19 @@ class _HomeShellState extends State<HomeShell> {
           appBar: AppBar(
             title: const Text('GateOps'),
             actions: [
+              ValueListenableBuilder<ThemeMode>(
+                valueListenable: _appThemeMode,
+                builder: (context, mode, _) {
+                  final isDark = mode == ThemeMode.dark;
+                  return IconButton(
+                    tooltip: isDark ? 'Gündüz Modu' : 'Gece Modu',
+                    onPressed: () {
+                      _appThemeMode.value = isDark ? ThemeMode.light : ThemeMode.dark;
+                    },
+                    icon: Icon(isDark ? Icons.light_mode_rounded : Icons.dark_mode_rounded),
+                  );
+                },
+              ),
               IconButton(
                 tooltip: 'Logout',
                 onPressed: () async {
@@ -1142,167 +1123,52 @@ class _ScanTabState extends State<ScanTab> {
   }
 
   
-  Map<String, String?>? _parseFromRaw(String raw) {
-    try {
-      return parseBoardingPayload(raw);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  String _normalizeSeat(String seat) => normalizeSeat(seat);
-
-  Future<PaxTag?> _pickTypeDialog() async {
-    if (!mounted) return null;
-    return showDialog<PaxTag>(
-      context: context,
-      barrierDismissible: true,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Tip Seç'),
-        content: const Text('Bu yolcu için işlem tipini seçin.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, PaxTag.dft),
-            child: const Text('DFT'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, PaxTag.pre),
-            child: const Text('Pre'),
-          ),
-        ],
-      ),
-    );
-  }
-
-
   Future<void> _handleBarcode(String raw) async {
     if (_busy) return;
-
-    final parsed = _parseFromRaw(raw);
-    if (parsed == null) {
-      _toast('Biniş kartı formatı okunamadı.');
-      return;
-    }
-
-    final seat = _normalizeSeat((parsed['seat'] ?? '').trim());
-    if (seat.isEmpty) {
-      _toast('Seat okunamadı.');
-      return;
-    }
-
-    final tag = await _pickTypeDialog();
-    if (tag == null) return;
-
     setState(() => _busy = true);
+    _lastRaw = raw;
+
     try {
-      final user = FirebaseAuth.instance.currentUser;
-      final uid = user?.uid ?? 'unknown';
-      final email = user?.email ?? 'unknown';
+      // 1) Parse
+      final expected = _normalizeFlight(widget.flightCode);
+      final parsed = _parseFromRaw(raw, expectedFlightCode: expected) ?? await _manualEntryDialog(raw, expectedFlightCode: expected);
+      if (parsed == null) {
+        _toast('Kart okunamadı. Manuel giriş yapabilirsiniz.');
+        return;
+      }
 
-      final sessionRef = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
-      final paxDoc = _paxCol.doc(); // auto id
-      final seatLockDoc = _seatLockDoc(seat);
+      // 2) Flight must match current session flight
+      final got = _normalizeFlight(parsed.flightCode);
+      if (expected.isNotEmpty && got.isNotEmpty && expected != got) {
+        _toast('Farklı uçuş: $got (beklenen $expected)');
+        return;
+      }
 
-      final now = DateTime.now();
-      final isInfant =
-          (parsed['infant'] ?? '').toLowerCase() == '1' || (parsed['infant'] ?? '').toLowerCase() == 'true';
+      // 3) Choose action
+      final tag = await _pickTypeDialog(parsed);
+      if (tag == null) return;
 
-      // Transaction rule: ALL reads first, then writes.
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        final seatSnap = await tx.get(seatLockDoc);
-        final sessionSnap = await tx.get(sessionRef);
+      // 4) Save
+      await _saveScan(parsed, tag: tag, forceInfant: false);
 
-        if (!isInfant && seatSnap.exists) {
-          final data = seatSnap.data();
-          throw _SeatDuplicateException(seat);
-          }
-
-        final surname = (parsed['surname'] ?? '').trim();
-        final given = (parsed['given'] ?? '').trim();
-        final full = (surname.isEmpty && given.isEmpty) ? '' : '$surname/$given';
-
-        final pax = Pax(
-          id: paxDoc.id,
-          flightCode: widget.flightCode,
-          seat: seat,
-          surname: surname,
-          givenName: given,
-          fullName: full,
-          tag: isInfant ? PaxTag.infant : tag,
-          status: PaxStatus.active,
-          isInfant: isInfant,
-          scannedAt: now,
-          lastEvent: PaxEvent.scanned,
-          lastActorUid: uid,
-          lastActorEmail: email,
-          raw: raw,
-          source: 'camera',
-        );
-
-        // Writes (after reads)
-        tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
-
-        // Seat lock only for non-infant (so infant duplicates allowed)
-        if (!isInfant) {
-          tx.set(
-            seatLockDoc,
-            {
-              'seat': seat,
-              'occupiedBy': paxDoc.id,
-              'occupiedAt': Timestamp.fromDate(now),
-              'flightCode': widget.flightCode,
-            },
-            SetOptions(merge: true),
-          );
-        }
-
-        final sData = sessionSnap.data() ?? <String, dynamic>{};
-        if (sData['firstPaxAt'] == null) {
-          tx.set(sessionRef, {'firstPaxAt': Timestamp.fromDate(now)}, SetOptions(merge: true));
-        }
-        tx.set(sessionRef, {'lastPaxAt': Timestamp.fromDate(now)}, SetOptions(merge: true));
-      });
-
-      _toast('${tag == PaxTag.dft ? 'DFT' : (tag == PaxTag.pre ? 'Pre' : 'INF')} kaydedildi: $seat');
+      _toast('${tag == PaxTag.dft ? 'DFT' : 'Pre'} kaydedildi: ${_normalizeSeat(parsed.seat)}');
     } on _SeatDuplicateException catch (e) {
       final proceed = await _confirm(
         'Mükerrer Seat',
-        'Bu uçuşta aynı seat (infant hariç) olamaz.\nSeat: ${e.seat}\nDevam edilsin mi? (Infant olarak işaretlenecek)',
+        'Bu uçuşta aynı seat (infant hariç) olamaz.\n'
+        'Seat: ${e.seat}\n\n'
+        'Bu yolcuyu INFANT olarak kaydetmek ister misin?',
       );
-      if (!proceed) return;
-
-      // Force add as infant (no seat lock)
-      final user = FirebaseAuth.instance.currentUser;
-      final uid = user?.uid ?? 'unknown';
-      final email = user?.email ?? 'unknown';
-      final paxDoc = _paxCol.doc();
-      final now = DateTime.now();
-
-      final surname = (parsed['surname'] ?? '').trim();
-      final given = (parsed['given'] ?? '').trim();
-      final full = (surname.isEmpty && given.isEmpty) ? '' : '$surname/$given';
-
-      final pax = Pax(
-        id: paxDoc.id,
-        flightCode: widget.flightCode,
-        seat: seat,
-        surname: surname,
-        givenName: given,
-        fullName: full,
-        tag: PaxTag.infant,
-        status: PaxStatus.active,
-        isInfant: true,
-        scannedAt: now,
-        lastEvent: PaxEvent.scanned,
-        lastActorUid: uid,
-        lastActorEmail: email,
-        raw: raw,
-        source: 'camera',
-      );
-
-      await paxDoc.set(pax.toMap(), SetOptions(merge: true));
-      _toast('Infant olarak eklendi: $seat');
+      if (proceed) {
+        final parsed = _parseFromRaw(_lastRaw ?? '') ?? await _manualEntryDialog(_lastRaw ?? '');
+        if (parsed != null) {
+          final tag = await _pickTypeDialog(parsed);
+          if (tag != null) {
+            await _saveScan(parsed, tag: tag, forceInfant: true);
+            _toast('INFANT kaydedildi: ${_normalizeSeat(parsed.seat)}');
+          }
+        }
+      }
     } catch (e, st) {
       showOpError(context, e, st);
     } finally {
@@ -1311,8 +1177,277 @@ class _ScanTabState extends State<ScanTab> {
     }
   }
 
+  Future<void> _saveScan(_ParsedScan parsed, {required PaxTag tag, required bool forceInfant}) async {
+    final seatNorm = _normalizeSeat(parsed.seat);
+    if (seatNorm.isEmpty) {
+      throw StateError('seat-empty');
+    }
+
+    final nowTs = Timestamp.now();
+    final paxId = '${nowTs.millisecondsSinceEpoch}_$seatNorm';
+    final paxDoc = _paxCol.doc(paxId);
+    final seatDoc = _seatLockDoc(seatNorm);
+    final sessionDoc = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
+
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      // Transactions require all reads before any writes.
+      final seatSnap = await tx.get(seatDoc);
+      final sessionSnap = await tx.get(sessionDoc);
+
+      if (seatSnap.exists) {
+        final occupiedBy = (seatSnap.data()?['occupiedBy'] as String?) ?? '';
+        final isInfant = (seatSnap.data()?['isInfant'] as bool?) ?? false;
+        if (!forceInfant && !isInfant) {
+          throw _SeatDuplicateException(seatNorm, occupiedBy: occupiedBy);
+        }
+      }
+
+      final pax = Pax(
+        id: paxId,
+        flightCode: _normalizeFlight(parsed.flightCode),
+        fullName: parsed.fullName,
+        surname: parsed.surname,
+        givenName: parsed.givenName,
+        seat: seatNorm,
+        tag: tag,
+        status: PaxStatus.active,
+        scannedAt: DateTime.now(),
+        lastEvent: tag == PaxTag.dft ? 'dft' : 'pre',
+        isInfant: forceInfant,
+      );
+
+      // writes
+      tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
+      tx.set(
+        seatDoc,
+        {
+          'seat': seatNorm,
+          'occupiedBy': paxId,
+          'occupiedAt': nowTs,
+          'isInfant': forceInfant,
+          'lastTag': tag.name,
+        },
+        SetOptions(merge: true),
+      );
+
+      final sessionData = sessionSnap.data() as Map<String, dynamic>? ?? <String, dynamic>{};
+      if (sessionData['firstPaxAt'] == null) {
+        tx.set(sessionDoc, {'firstPaxAt': nowTs}, SetOptions(merge: true));
+      }
+      tx.set(sessionDoc, {'lastPaxAt': nowTs}, SetOptions(merge: true));
+    });
+  }
+
+  String _normalizeFlight(String v) {
+    final s = v.trim().toUpperCase().replaceAll(' ', '');
+    final m = RegExp(r'^([A-Z0-9]{2,3})(\d{1,5})$').firstMatch(s);
+    if (m == null) return s;
+    final carrier = m.group(1)!;
+    final num = m.group(2)!.replaceFirst(RegExp(r'^0+'), '');
+    return '$carrier$num';
+  }
+
+  String _normalizeSeat(String v) {
+    var s = v.trim().toUpperCase().replaceAll(' ', '');
+    if (s.isEmpty) return '';
+    // common: 003A -> 3A
+    final m4 = RegExp(r'^(\d{1,3})([A-Z])$').firstMatch(s);
+    if (m4 != null) {
+      final num = m4.group(1)!.replaceFirst(RegExp(r'^0+'), '');
+      return '${num.isEmpty ? '0' : num}${m4.group(2)!}';
+    }
+    // try to find inside
+    final m = RegExp(r'\b(\d{1,3})([A-Z])\b').firstMatch(s);
+    if (m != null) {
+      final num = m.group(1)!.replaceFirst(RegExp(r'^0+'), '');
+      return '${num.isEmpty ? '0' : num}${m.group(2)!}';
+    }
+    return s;
+  }
+
+  _ParsedScan? _parseFromRaw(String raw, {String expectedFlightCode = ''}) {
+    final v = raw.trim();
+    if (v.isEmpty) return null;
+
+    // BCBP raw (IATA) usually starts with 'M' and has fixed fields
+    if (v.length >= 60 && v[0] == 'M') {
+      try {
+        final nameField = v.substring(2, 22).trim(); // SURNAME/GIVEN
+        String surname = '';
+        String givenName = '';
+        if (nameField.contains('/')) {
+          final parts = nameField.split('/');
+          surname = parts[0].trim();
+          givenName = parts.sublist(1).join('/').trim();
+        } else {
+          surname = nameField.trim();
+        }
+
+        final legCount = int.tryParse(v.substring(1, 2)) ?? 1;
+
+        // Per-leg fields start after the common header (30 chars)
+        // Header: format(1) + legs(1) + name(20) + eTicket(1) + PNR(7) = 30
+        const legSize = 28; // from(3)+to(3)+carrier(3)+flight(5)+date(3)+comp(1)+seat(4)+seq(5)+status(1)
+        const legsStart = 30;
+
+        String bestCarrier = '';
+        String bestFlightNum = '';
+        String bestSeatField = '';
+
+        final expectedNorm = _normalizeFlight(expectedFlightCode);
+
+        for (int i = 0; i < legCount; i++) {
+          final off = legsStart + (i * legSize);
+          if (v.length < off + legSize) break;
+
+          final carrier = v.substring(off + 6, off + 9).trim();
+          final flightNum = v.substring(off + 9, off + 14).trim();
+          final seatField = v.substring(off + 18, off + 22).trim();
+
+          if (bestCarrier.isEmpty) {
+            bestCarrier = carrier;
+            bestFlightNum = flightNum;
+            bestSeatField = seatField;
+          }
+
+          final thisFlight = _normalizeFlight('$carrier$flightNum');
+          if (expectedNorm.isNotEmpty && thisFlight == expectedNorm) {
+            bestCarrier = carrier;
+            bestFlightNum = flightNum;
+            bestSeatField = seatField;
+            break;
+          }
+        }
+
+        final flightCode = _normalizeFlight('$bestCarrier$bestFlightNum');
+        final seat = _normalizeSeat(bestSeatField);
+
+        final fullName = (givenName.isEmpty) ? surname : '$givenName $surname';
+
+        if (seat.isEmpty || flightCode.isEmpty) return null;
+
+        return _ParsedScan(
+          raw: raw,
+          flightCode: flightCode,
+          seat: seat,
+          surname: surname,
+          givenName: givenName,
+          fullName: fullName,
+          isBCBP: true,
+        );
+      } catch (_) {
+        // fallthrough to heuristic
+      }
+    }
+
+    // Heuristic parsing for non-BCBP / vendor formats
+    final flightMatch = RegExp(r'\b([A-Z0-9]{2,3})\s*0?(\d{3,5})\b').firstMatch(v.toUpperCase());
+    final flightCode = flightMatch == null ? '' : _normalizeFlight('${flightMatch.group(1)}${flightMatch.group(2)}');
+
+    final seatMatch = RegExp(r'\b(\d{1,3}\s*[A-Z])\b').firstMatch(v.toUpperCase());
+    final seat = seatMatch == null ? '' : _normalizeSeat(seatMatch.group(1)!.replaceAll(' ', ''));
+
+    // Name heuristic (very unreliable)
+    String surname = '';
+    String givenName = '';
+    final nameMatch = RegExp(r'\b([A-Z]{2,})/([A-Z]{2,})\b').firstMatch(v.toUpperCase());
+    if (nameMatch != null) {
+      surname = nameMatch.group(1)!.trim();
+      givenName = nameMatch.group(2)!.trim();
+    }
+    final fullName = (givenName.isEmpty) ? surname : '$givenName $surname';
+
+    if (seat.isEmpty) return null;
+
+    return _ParsedScan(
+      raw: raw,
+      flightCode: flightCode,
+      seat: seat,
+      surname: surname,
+      givenName: givenName,
+      fullName: fullName,
+      isBCBP: false,
+    );
+  }
+
+  Future<PaxTag?> _pickTypeDialog(_ParsedScan parsed) async {
+    return showDialog<PaxTag>(
+      context: context,
+      builder: (_) {
+        return AlertDialog(
+          title: const Text('İşlem Türü'),
+          content: Text(
+            'Uçuş: ${parsed.flightCode.isEmpty ? widget.flightCode : parsed.flightCode}\n'
+            'Seat: ${_normalizeSeat(parsed.seat)}\n'
+            'İsim: ${parsed.fullName.isEmpty ? '-' : parsed.fullName}',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Vazgeç')),
+            FilledButton(onPressed: () => Navigator.pop(context, PaxTag.dft), child: const Text('DFT')),
+            FilledButton(onPressed: () => Navigator.pop(context, PaxTag.pre), child: const Text('Pre')),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<_ParsedScan?> _manualEntryDialog(String raw, {String expectedFlightCode = ''}) async {
+    // Only open manual input if camera read failed / user wants override.
+    // If raw is non-empty but parsing failed, still allow manual entry.
+    final flightCtrl = TextEditingController(text: widget.flightCode);
+    final seatCtrl = TextEditingController();
+    final surnameCtrl = TextEditingController();
+    final givenCtrl = TextEditingController();
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) {
+        return AlertDialog(
+          title: const Text('Manuel Giriş'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(controller: flightCtrl, readOnly: true, decoration: const InputDecoration(labelText: 'Uçuş Kodu (örn BA679)')),
+                const SizedBox(height: 8),
+                TextField(controller: seatCtrl, decoration: const InputDecoration(labelText: 'Seat (örn 3A)')),
+                const SizedBox(height: 8),
+                TextField(controller: givenCtrl, decoration: const InputDecoration(labelText: 'Ad')),
+                const SizedBox(height: 8),
+                TextField(controller: surnameCtrl, decoration: const InputDecoration(labelText: 'Soyad')),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Vazgeç')),
+            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Kaydet')),
+          ],
+        );
+      },
+    );
+
+    if (ok != true) return null;
+
+    final flight = _normalizeFlight(flightCtrl.text);
+    final seat = _normalizeSeat(seatCtrl.text);
+    final surname = surnameCtrl.text.trim().toUpperCase();
+    final givenName = givenCtrl.text.trim().toUpperCase();
+    final fullName = ((givenName.isEmpty && surname.isEmpty) ? '' : '$givenName $surname').trim();
+
+    if (seat.isEmpty) return null;
+
+    return _ParsedScan(
+      raw: raw,
+      flightCode: flight.isEmpty ? _normalizeFlight(widget.flightCode) : flight,
+      seat: seat,
+      surname: surname,
+      givenName: givenName,
+      fullName: fullName,
+      isBCBP: false,
+    );
+  }
+
 Future<void> _forceAddAsInfant() async {
-    final now = DateTime.now();
     final raw = _lastRaw;
     if (raw == null) return;
     final parsed = parseBoardingPayload(raw);
@@ -1348,7 +1483,7 @@ Future<void> _forceAddAsInfant() async {
             status: PaxStatus.active,
             isInfant: true,
             scannedAt: DateTime.now(),
-            lastEvent: PaxEvent.scanned,
+            lastEvent: 'scanned',
           ).toMap(),
           SetOptions(merge: true),
         );
@@ -1488,6 +1623,19 @@ Future<void> _forceAddAsInfant() async {
                                   },
                                   icon: Icon(_cameraOn ? Icons.videocam_off_rounded : Icons.videocam_rounded, color: Colors.white),
                                 ),
+                          const SizedBox(width: 8),
+                          IconButton(
+                            tooltip: 'Tara / Manuel',
+                            onPressed: () async {
+                              final expected = _normalizeFlight(widget.flightCode);
+                              final parsed = await _manualEntryDialog(_lastRaw ?? '', expectedFlightCode: expected);
+                              if (parsed == null) return;
+                              final tag = await _pickTypeDialog(parsed);
+                              if (tag == null) return;
+                              await _saveScan(parsed, tag: tag, forceInfant: false);
+                            },
+                            icon: const Icon(Icons.edit_note_rounded, color: Colors.white),
+                          ),
                               ],
                             ),
                           ),
@@ -1594,8 +1742,9 @@ Future<void> _forceAddAsInfant() async {
 }
 
 class _SeatDuplicateException implements Exception {
-  _SeatDuplicateException(this.seat);
+  _SeatDuplicateException(this.seat, {this.occupiedBy = ''});
   final String seat;
+  final String occupiedBy;
 }
 
 enum _ScanAction { dft, pre, offload }
