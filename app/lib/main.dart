@@ -1287,10 +1287,10 @@ class _ScanTabState extends State<ScanTab> {
     }
 
     // Heuristic parsing for non-BCBP / vendor formats
-    final flightMatch = RegExp(r'\b([A-Z0-9]{2,3})\s*0?(\d{3,5})\b').firstMatch(v.toUpperCase());
+    final flightMatch = RegExp(r'''\b([A-Z0-9]{2,3})\s*0?(\d{3,5})\b''').firstMatch(v.toUpperCase());
     final flightCode = flightMatch == null ? '' : _normalizeFlight('${flightMatch.group(1)}${flightMatch.group(2)}');
 
-    final seatMatch = RegExp(r'\b(\d{1,3}\s*[A-Z])\b').firstMatch(v.toUpperCase());
+    final seatMatch = RegExp(r'''\b(\d{1,3}\s*[A-Z])\b''').firstMatch(v.toUpperCase());
     final seat = seatMatch == null ? '' : _normalizeSeat(seatMatch.group(1)!.replaceAll(' ', ''));
 
     // Name heuristic (very unreliable)
