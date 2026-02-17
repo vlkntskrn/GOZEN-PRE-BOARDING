@@ -1240,15 +1240,21 @@ class _ScanTabState extends State<ScanTab> {
 
   Future<void> _checkNetAndOfferOffline() async {
     if (!mounted) return;
+
+    // Only act if this tab/screen is currently visible to avoid framework asserts.
+    final route = ModalRoute.of(context);
+    if (route == null || route.isCurrent != true) return;
+
     if (_offlineByPrompt) {
       // offline moddayken internet geldi mi?
       final ok = await _hasInternet();
       if (ok) {
-        try { await FirebaseFirestore.instance.enableNetwork(); } catch (_) {}
-        if (mounted) {
-          setState(() => _offlineByPrompt = false);
-          _toast('İnternet geldi. Senkronizasyon yapılıyor…');
-        }
+        try {
+          await FirebaseFirestore.instance.enableNetwork();
+        } catch (_) {}
+        if (!mounted) return;
+        setState(() => _offlineByPrompt = false);
+        _toast('İnternet geldi. Senkronizasyon yapılıyor…');
       }
       return;
     }
@@ -1259,25 +1265,44 @@ class _ScanTabState extends State<ScanTab> {
     if (_promptShowing) return;
     _promptShowing = true;
 
-    final agree = await showDialog<bool>(
-          context: context,
-          builder: (c) => AlertDialog(
-            title: const Text('İnternet yok'),
-            content: const Text('Offline moda geçilsin mi? Offline modda kayıtlar cihazda sıraya alınır ve internet gelince otomatik senkronize olur.'),
-            actions: [
-              TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text('Hayır')),
-              FilledButton(onPressed: () => Navigator.of(c).pop(true), child: const Text('Evet, Offline')),
-            ],
-          ),
-        ) ??
-        false;
+    // Delay to next frame to avoid calling showDialog during build/dispose phases.
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted) {
+      _promptShowing = false;
+      return;
+    }
+    final r2 = ModalRoute.of(context);
+    if (r2 == null || r2.isCurrent != true) {
+      _promptShowing = false;
+      return;
+    }
 
-    _promptShowing = false;
-    if (!mounted) return;
-    if (agree) {
-      try { await FirebaseFirestore.instance.disableNetwork(); } catch (_) {}
-      setState(() => _offlineByPrompt = true);
-      _toast('Offline mod aktif.');
+    bool? agree;
+    try {
+      agree = await showDialog<bool>(
+        context: context,
+        barrierDismissible: true,
+        builder: (c) => AlertDialog(
+          title: const Text('İnternet yok'),
+          content: const Text('Offline moda geçilsin mi? (İnternet gelince otomatik senkronize eder)'),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text('Hayır')),
+            FilledButton(onPressed: () => Navigator.of(c).pop(true), child: const Text('Evet')),
+          ],
+        ),
+      );
+    } catch (_) {
+      // If dialog failed due to route changes, just ignore.
+    } finally {
+      _promptShowing = false;
+    }
+
+    if (agree == true) {
+      try {
+        await FirebaseFirestore.instance.disableNetwork();
+      } catch (_) {}
+      if (mounted) setState(() => _offlineByPrompt = true);
+      _toast('Offline mod aktif. Kayıtlar cihazda tutulacak.');
     }
   }
 
@@ -1387,37 +1412,25 @@ class _ScanTabState extends State<ScanTab> {
     final seatDoc = _seatLockDoc(seatNorm);
     final sessionDoc = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
 
-    await FirebaseFirestore.instance.runTransaction((tx) async {
-      // Transactions require all reads before any writes.
-      final seatSnap = await tx.get(seatDoc);
-      final sessionSnap = await tx.get(sessionDoc);
+    final pax = Pax(
+      id: paxId,
+      flightCode: _normalizeFlight(parsed.flightCode),
+      fullName: parsed.fullName,
+      surname: parsed.surname,
+      givenName: parsed.givenName,
+      seat: seatNorm,
+      tag: tag,
+      status: PaxStatus.active,
+      scannedAt: DateTime.now(),
+      lastEvent: tag == PaxTag.dft ? 'dft' : 'pre',
+      isInfant: forceInfant,
+    );
 
-      if (seatSnap.exists) {
-        final occupiedBy = (seatSnap.data()?['occupiedBy'] as String?) ?? '';
-        final isInfant = (seatSnap.data()?['isInfant'] as bool?) ?? false;
-        if (!forceInfant && !isInfant) {
-          throw _SeatDuplicateException(seatNorm, occupiedBy: occupiedBy);
-        }
-      }
-
-      final pax = Pax(
-        id: paxId,
-        flightCode: _normalizeFlight(parsed.flightCode),
-        fullName: parsed.fullName,
-        surname: parsed.surname,
-        givenName: parsed.givenName,
-        seat: seatNorm,
-        tag: tag,
-        status: PaxStatus.active,
-        scannedAt: DateTime.now(),
-        lastEvent: tag == PaxTag.dft ? 'dft' : 'pre',
-        isInfant: forceInfant,
-      );
-
-      // writes
-      tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
-      tx.set(
-        seatDoc,
+    Future<void> offlineWrite() async {
+      // IMPORTANT: Firestore transactions do not work when network is unavailable.
+      // In offline mode we do best-effort local writes; duplicates may be resolved on sync.
+      await paxDoc.set(pax.toMap(), SetOptions(merge: true));
+      await seatDoc.set(
         {
           'seat': seatNorm,
           'occupiedBy': paxId,
@@ -1427,13 +1440,62 @@ class _ScanTabState extends State<ScanTab> {
         },
         SetOptions(merge: true),
       );
+      // Don't attempt reads for firstPaxAt in offline mode; just update lastPaxAt.
+      await sessionDoc.set({'lastPaxAt': nowTs}, SetOptions(merge: true));
+    }
 
-      final sessionData = sessionSnap.data() as Map<String, dynamic>? ?? <String, dynamic>{};
-      if (sessionData['firstPaxAt'] == null) {
-        tx.set(sessionDoc, {'firstPaxAt': nowTs}, SetOptions(merge: true));
+    // If we already switched to offline-by-prompt, never run a transaction.
+    if (_offlineByPrompt) {
+      await offlineWrite();
+      return;
+    }
+
+    try {
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        // Transactions require all reads before any writes.
+        final seatSnap = await tx.get(seatDoc);
+        final sessionSnap = await tx.get(sessionDoc);
+
+        if (seatSnap.exists) {
+          final occupiedBy = (seatSnap.data()?['occupiedBy'] as String?) ?? '';
+          final isInfant = (seatSnap.data()?['isInfant'] as bool?) ?? false;
+          if (!forceInfant && !isInfant) {
+            throw _SeatDuplicateException(seatNorm, occupiedBy: occupiedBy);
+          }
+        }
+
+        // writes
+        tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
+        tx.set(
+          seatDoc,
+          {
+            'seat': seatNorm,
+            'occupiedBy': paxId,
+            'occupiedAt': nowTs,
+            'isInfant': forceInfant,
+            'lastTag': tag.name,
+          },
+          SetOptions(merge: true),
+        );
+
+        final sessionData = sessionSnap.data() as Map<String, dynamic>? ?? <String, dynamic>{};
+        if (sessionData['firstPaxAt'] == null) {
+          tx.set(sessionDoc, {'firstPaxAt': nowTs}, SetOptions(merge: true));
+        }
+        tx.set(sessionDoc, {'lastPaxAt': nowTs}, SetOptions(merge: true));
+      });
+    } on FirebaseException catch (e) {
+      // Typical when offline / transient Firestore outage.
+      if (e.code == 'unavailable' || e.code == 'network-error' || e.code == 'failed-precondition') {
+        await offlineWrite();
+        if (mounted) {
+          setState(() => _offlineByPrompt = true);
+        }
+        _toast('Firebase erişilemiyor. Kayıt offline olarak eklendi.');
+        return;
       }
-      tx.set(sessionDoc, {'lastPaxAt': nowTs}, SetOptions(merge: true));
-    });
+      rethrow;
+    }
   }
 
   String _normalizeFlight(String v) {
@@ -1927,18 +1989,30 @@ Future<void> _forceAddAsInfant() async {
 
   
   Future<void> _inviteUser() async {
+    if (!mounted) return;
+    final route = ModalRoute.of(context);
+    if (route == null || route.isCurrent != true) return;
+
     final ctl = TextEditingController();
     try {
+      // Defer to next frame to avoid framework asserts.
+      await Future<void>.delayed(Duration.zero);
+      if (!mounted) return;
+
       final name = await showDialog<String>(
         context: context,
+        barrierDismissible: true,
         builder: (c) => AlertDialog(
-          title: const Text('Kullanıcı davet et'),
+          title: const Text('Kullanıcı Davet Et'),
           content: TextField(
             controller: ctl,
-            decoration: const InputDecoration(labelText: 'Kullanıcı adı (login adı)'),
+            decoration: const InputDecoration(
+              hintText: 'isim soyisim',
+              labelText: 'Kullanıcı',
+            ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.of(c).pop(null), child: const Text('İptal')),
+            TextButton(onPressed: () => Navigator.of(c).pop(), child: const Text('İptal')),
             FilledButton(onPressed: () => Navigator.of(c).pop(ctl.text.trim()), child: const Text('Davet Et')),
           ],
         ),
@@ -1946,6 +2020,13 @@ Future<void> _forceAddAsInfant() async {
 
       final v = (name ?? '').trim();
       if (v.isEmpty) return;
+
+      // If offline, don't attempt to invite (needs server read + write).
+      final okNet = await _hasInternet();
+      if (!okNet || _offlineByPrompt) {
+        _toast('Offline modda davet gönderilemez. İnternet gelince tekrar deneyin.');
+        return;
+      }
 
       final qs = await FirebaseFirestore.instance.collection('users').where('displayName', isEqualTo: v).limit(1).get();
       if (qs.docs.isEmpty) {
@@ -1957,28 +2038,36 @@ Future<void> _forceAddAsInfant() async {
       final me = FirebaseAuth.instance.currentUser?.uid ?? '';
       final sref = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
 
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        final sdoc = await tx.get(sref);
-        final createdBy = (sdoc.data()?['createdByUid'] ?? '') as String;
-        final myUser = await tx.get(FirebaseFirestore.instance.collection('users').doc(me));
-        final isAdmin = (myUser.data()?['isAdmin'] ?? false) == true;
+      try {
+        await FirebaseFirestore.instance.runTransaction((tx) async {
+          final sdoc = await tx.get(sref);
+          final createdBy = (sdoc.data()?['createdByUid'] ?? '') as String;
+          final myUser = await tx.get(FirebaseFirestore.instance.collection('users').doc(me));
+          final isAdmin = (myUser.data()?['isAdmin'] ?? false) == true;
 
-        if (!isAdmin && createdBy != me) {
-          throw Exception('only owner/admin');
-        }
+          if (!isAdmin && createdBy != me) {
+            throw Exception('only owner/admin');
+          }
 
-        final allowed = (sdoc.data()?['allowedUids'] as List?)?.cast<String>() ?? <String>[];
-        if (!allowed.contains(invitedUid)) allowed.add(invitedUid);
+          final allowed = (sdoc.data()?['allowedUids'] as List?)?.cast<String>() ?? <String>[];
+          if (!allowed.contains(invitedUid)) allowed.add(invitedUid);
 
-        tx.set(sref, {'allowedUids': allowed}, SetOptions(merge: true));
-        tx.set(sref.collection('events').doc(), {
-          'type': 'invite',
-          'invitedUid': invitedUid,
-          'invitedName': v,
-          'actorUid': me,
-          'at': FieldValue.serverTimestamp(),
+          tx.set(sref, {'allowedUids': allowed}, SetOptions(merge: true));
+          tx.set(sref.collection('events').doc(), {
+            'type': 'invite',
+            'invitedUid': invitedUid,
+            'invitedName': v,
+            'actorUid': me,
+            'at': FieldValue.serverTimestamp(),
+          });
         });
-      });
+      } on FirebaseException catch (e) {
+        if (e.code == 'unavailable' || e.code == 'network-error') {
+          _toast('Firebase geçici olarak erişilemiyor. Lütfen tekrar deneyin.');
+          return;
+        }
+        rethrow;
+      }
 
       _toast('Davet gönderildi: $v');
     } catch (e) {
@@ -1987,6 +2076,7 @@ Future<void> _forceAddAsInfant() async {
       ctl.dispose();
     }
   }
+
 
 Future<bool> _maybeWatchlistAlert(String fullName) async {
     final norm = normalizeFullName(fullName);
