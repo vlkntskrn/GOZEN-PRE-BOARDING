@@ -1,185 +1,295 @@
-// GateOps Cloud Sync (Android) - Single file main.dart
-// Features:
-// - Firebase Auth login (email/password) with username form (isim.soyisim -> isim.soyisim@gozen.local)
-// - Firestore realtime multi-device sync (10+ devices)
-// - Flight session create/join
-// - Camera barcode scan (mobile_scanner) + parser for common barcode payloads (best-effort)
-// - Pax tagging: DFT (== Randomly Selected) or Pre-Boarded
-// - Offload flow + re-entry warning (offloaded pax re-scan prompts and re-adds as DFT)
-// - Seat duplicate warning (non-infant pax cannot share same seat within same flight session)
-// - Equipment (Table/Desk/ETD with model IS600 / Itemiser 4DX) + multi-serial support
-// - Personnel (manual name + title from list)
-// - Operation Times tab
-// - XLSX export (pax + dft + equipment + times + personnel with signature columns)
+// lib/main.dart
+// Gate Ops MVP (Single file) — Flutter Web prototype
 //
-// NOTE: To keep internal operations practical, user creation is expected to be done in Firebase Console.
-// Admin role is stored under /users/{uid}. This app reads that role and gates admin-only UI.
+// ✅ Update: Gate tahsis BİTİŞ alanı kaldırıldı (sadece başlangıç var)
+// ✅ Update: Kullanıcı girişi eklendi
+//    - İlk kurulum: Master şifre oluştur
+//    - Admin Mode: Master şifre ile giriş -> SADECE USER ekle/sil/şifre reset
+//    - Kullanıcı girişi: isim.soyisim + şifre
+//
+// ⚠️ Not (paket): Bu dosya, şifre hashlemek için `crypto` paketini kullanır.
+// pubspec.yaml içine ekleyin:
+//   dependencies:
+//     crypto: ^3.0.3
+//
+// ⚠️ Not (depolama): MVP'de kullanıcılar ve master bilgisi tarayıcı localStorage’da saklanır.
+// (Web için uygundur. Mobil/desktop hedeflenirse storage katmanı ayrıca ele alınmalıdır.)
 
-import 'dart:async';
-import 'dart:io';
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
 
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:excel/excel.dart' as xls;
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_core/firebase_core.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+// Web localStorage (Flutter Web için)
 
-// ---- Utilities (top-level) ----
-String normalizeFullName(String v) {
-  final up = v.trim().toUpperCase();
-  if (up.isEmpty) return '';
-  // Keep letters/numbers/spaces (incl Turkish chars), collapse spaces.
-  final cleaned = up
-      .replaceAll(RegExp(r'[^A-ZÇĞİÖŞÜ0-9\s]'), ' ')
-      .replaceAll(RegExp(r'\s+'), ' ')
-      .trim();
-  return cleaned;
-}
-
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
-  runApp(const GateOpsApp());
+  await AuthStore.init();
+  runApp(const GateOpsRoot());
 }
 
-/// Shows a detailed operation error to help field debugging (internal app).
-/// In release builds, this still shows the Firebase error code (if any).
-void showOpError(BuildContext context, Object error, [StackTrace? st]) {
-  String title = 'Islem hatasi';
-  String detail = '';
+/* =========================================================
+   AUTH STORAGE (SecureStorage)
+========================================================= */
 
-  if (error is FirebaseException) {
-    final code = error.code;
-    final msg = (error.message ?? '').trim();
-    title = 'Firebase: $code';
-    detail = msg.isNotEmpty ? msg : error.toString();
-  } else {
-    detail = error.toString();
-  }
+class AuthStore {
+  static const _key = 'gateops_auth_v1';
 
-  final stackText = st != null ? '\n\nSTACK\n${st.toString()}' : '';
-  final fullText = '${title}\n${detail}${stackText}';
-
-  debugPrint('GateOps ERROR: $fullText');
-
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      content: Text(
-        fullText,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-      ),
-      duration: const Duration(seconds: 10),
-      behavior: SnackBarBehavior.floating,
-      action: SnackBarAction(
-        label: 'DETAY',
-        onPressed: () async {
-          await showDialog<void>(
-            context: context,
-            builder: (ctx) => AlertDialog(
-              title: Text(title),
-              content: SingleChildScrollView(
-                child: SelectableText(fullText),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: fullText));
-                    if (ctx.mounted) {
-                      Navigator.of(ctx).pop();
-                    }
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Kopyalandi')),
-                    );
-                  },
-                  child: const Text('KOPYALA'),
-                ),
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('KAPAT'),
-                ),
-              ],
-            ),
-          );
-        },
-      ),
-    ),
+  static const FlutterSecureStorage _storage = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
   );
-}
 
+  static AuthData _cache = AuthData.empty();
+  static bool _inited = false;
 
-// -------------------------
-// Theme
-// -------------------------
-
-class GateOpsApp extends StatefulWidget {
-  const GateOpsApp({super.key});
-
-  @override
-  State<GateOpsApp> createState() => _GateOpsAppState();
-}
-
-class _GateOpsAppState extends State<GateOpsApp> {
-  final ValueNotifier<ThemeMode> _mode = ValueNotifier(ThemeMode.light);
-
-  ThemeData _lightTheme() {
-    const red = Color(0xFFD60F2B);
-    const bg = Color(0xFFF7F7F8);
-    return ThemeData(
-      useMaterial3: true,
-      colorScheme: ColorScheme.fromSeed(seedColor: red, brightness: Brightness.light),
-      scaffoldBackgroundColor: bg,
-      appBarTheme: const AppBarTheme(centerTitle: true),
-      inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder()),
-      cardTheme: CardThemeData(
-        elevation: 0,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
-          side: BorderSide(color: Colors.black.withValues(alpha: 15)),
-        ),
-      ),
-    );
+  /// Must be called once before runApp().
+  static Future<void> init() async {
+    if (_inited) return;
+    _inited = true;
+    try {
+      final raw = await _storage.read(key: _key);
+      if (raw == null || raw.trim().isEmpty) {
+        _cache = AuthData.empty();
+        return;
+      }
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      _cache = AuthData.fromJson(map);
+    } catch (_) {
+      _cache = AuthData.empty();
+    }
   }
 
-  ThemeData _darkTheme() {
-    const red = Color(0xFFD60F2B);
-    const bg = Color(0xFF0F1115);
-    return ThemeData(
-      useMaterial3: true,
-      colorScheme: ColorScheme.fromSeed(seedColor: red, brightness: Brightness.dark),
-      scaffoldBackgroundColor: bg,
-      appBarTheme: const AppBarTheme(centerTitle: true),
-      inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder()),
-      cardTheme: CardThemeData(
-        elevation: 0,
-        color: const Color(0xFF171A21),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
-          side: BorderSide(color: Colors.white.withValues(alpha: 20)),
-        ),
-      ),
+  /// Synchronous access to the last loaded value.
+  static AuthData load() => _cache;
+
+  static void save(AuthData data) {
+    _cache = data;
+    // Fire-and-forget: persistence failures shouldn't break the app in MVP.
+    _storage.write(key: _key, value: jsonEncode(data.toJson())).catchError((_) {});
+  }
+
+  static void clearAll() {
+    _cache = AuthData.empty();
+    _storage.delete(key: _key).catchError((_) {});
+  }
+}
+
+class AuthData {
+  final MasterSecret? master;
+  final List<UserRecord> users;
+
+  const AuthData({required this.master, required this.users});
+
+  factory AuthData.empty() => const AuthData(master: null, users: []);
+
+  bool get hasMaster => master != null;
+
+  AuthData copyWith({MasterSecret? master, List<UserRecord>? users}) {
+    return AuthData(master: master ?? this.master, users: users ?? this.users);
+  }
+
+  Map<String, dynamic> toJson() => {
+        'master': master?.toJson(),
+        'users': users.map((e) => e.toJson()).toList(),
+      };
+
+  factory AuthData.fromJson(Map<String, dynamic> json) {
+    final m = json['master'];
+    final u = (json['users'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
+    return AuthData(
+      master: m == null ? null : MasterSecret.fromJson((m as Map).cast<String, dynamic>()),
+      users: u.map((e) => UserRecord.fromJson(e)).toList(),
     );
+  }
+}
+
+class MasterSecret {
+  final String saltB64;
+  final String hashB64;
+  const MasterSecret({required this.saltB64, required this.hashB64});
+
+  Map<String, dynamic> toJson() => {'saltB64': saltB64, 'hashB64': hashB64};
+
+  factory MasterSecret.fromJson(Map<String, dynamic> json) {
+    return MasterSecret(
+      saltB64: (json['saltB64'] ?? '') as String,
+      hashB64: (json['hashB64'] ?? '') as String,
+    );
+  }
+}
+
+class UserRecord {
+  final String username; // normalized: lowercase isim.soyisim
+  final String saltB64;
+  final String hashB64;
+
+  const UserRecord({required this.username, required this.saltB64, required this.hashB64});
+
+  Map<String, dynamic> toJson() => {'username': username, 'saltB64': saltB64, 'hashB64': hashB64};
+
+  factory UserRecord.fromJson(Map<String, dynamic> json) {
+    return UserRecord(
+      username: (json['username'] ?? '') as String,
+      saltB64: (json['saltB64'] ?? '') as String,
+      hashB64: (json['hashB64'] ?? '') as String,
+    );
+  }
+}
+
+class PasswordPolicy {
+  // min 8, upper, lower, digit, punctuation/special
+  static bool validate(String pwd) {
+    if (pwd.length < 8) return false;
+    final hasUpper = RegExp(r'[A-Z]').hasMatch(pwd);
+    final hasLower = RegExp(r'[a-z]').hasMatch(pwd);
+    final hasDigit = RegExp(r'\d').hasMatch(pwd);
+    final hasPunct = RegExp(r'''[!@#$%^&*(),.?":{}|<>_\-+=\[\]\/;\'"`~]''').hasMatch(pwd);
+    return hasUpper && hasLower && hasDigit && hasPunct;
+  }
+
+  static String hint() =>
+      'Min 8 karakter; büyük harf + küçük harf + rakam + noktalama/özel karakter içermeli.';
+}
+
+class UsernamePolicy {
+  // isim.soyisim (tek nokta, boşluk yok)
+  static final _re = RegExp(r'^[a-z]+(\.[a-z]+)+$'); // mehmet.yilmaz or ad.soyad.ek etc.
+
+  static String normalize(String u) => u.trim().toLowerCase();
+
+  static bool validate(String u) {
+    final n = normalize(u);
+    if (n.isEmpty) return false;
+    if (n.contains(' ')) return false;
+    return _re.hasMatch(n);
+  }
+
+  static String hint() => 'Format: isim.soyisim (küçük harf, boşluk yok)';
+}
+
+class CryptoUtil {
+  static Uint8List _randBytes(int n) {
+    final r = Random.secure();
+    return Uint8List.fromList(List<int>.generate(n, (_) => r.nextInt(256)));
+  }
+
+  static String genSaltB64([int n = 16]) => base64Encode(_randBytes(n));
+
+  static String hashB64(String saltB64, String password) {
+    final salt = base64Decode(saltB64);
+    final bytes = Uint8List.fromList([...salt, ...utf8.encode(password)]);
+    final digest = sha256.convert(bytes).bytes;
+    return base64Encode(digest);
+  }
+
+  static bool verify({required String saltB64, required String hashB64, required String password}) {
+    final h = hashB64Func(saltB64, password);
+    return h == hashB64;
+  }
+
+  static String hashB64Func(String saltB64, String password) => hashB64(saltB64, password);
+}
+
+/* =========================================================
+   ROOT + AUTH FLOW
+========================================================= */
+
+enum SessionMode { none, user, adminMode }
+
+class AppSession {
+  SessionMode mode = SessionMode.none;
+  String? username; // for user mode
+
+  void logout() {
+    mode = SessionMode.none;
+    username = null;
+  }
+}
+
+class GateOpsRoot extends StatefulWidget {
+  const GateOpsRoot({super.key});
+
+  @override
+  State<GateOpsRoot> createState() => _GateOpsRootState();
+}
+
+class _GateOpsRootState extends State<GateOpsRoot> {
+  final session = AppSession();
+  late AuthData auth;
+
+  @override
+  void initState() {
+    super.initState();
+    auth = AuthStore.load();
+  }
+
+  void _reloadAuth() {
+    setState(() => auth = AuthStore.load());
+  }
+
+  void _loginUser(String username) {
+    setState(() {
+      session.mode = SessionMode.user;
+      session.username = username;
+    });
+  }
+
+  void _loginAdmin() {
+    setState(() {
+      session.mode = SessionMode.adminMode;
+      session.username = null;
+    });
+  }
+
+  void _logout() {
+    setState(() => session.logout());
   }
 
   @override
   Widget build(BuildContext context) {
-    return ThemeScope(
-      mode: _mode,
-      child: ValueListenableBuilder<ThemeMode>(
-        valueListenable: _mode,
-        builder: (context, mode, _) {
-          return MaterialApp(
-            debugShowCheckedModeBanner: false,
-            title: 'GOZEN PRE-BOARDING',
-            theme: _lightTheme(),
-            darkTheme: _darkTheme(),
-            themeMode: mode,
-            home: const _AuthGate(),
+    return MaterialApp(
+      title: 'Gate Ops',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(useMaterial3: true),
+      home: Builder(
+        builder: (context) {
+          if (!auth.hasMaster) {
+            return MasterSetupScreen(
+              onDone: () {
+                _reloadAuth();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Master şifre oluşturuldu. Admin Mode ile kullanıcı ekleyebilirsin.')),
+                );
+              },
+            );
+          }
+
+          if (session.mode == SessionMode.none) {
+            return LoginScreen(
+              auth: auth,
+              onAuthChanged: _reloadAuth,
+              onUserLogin: _loginUser,
+              onAdminLogin: _loginAdmin,
+            );
+          }
+
+          if (session.mode == SessionMode.adminMode) {
+            return AdminShell(
+              auth: auth,
+              onAuthChanged: _reloadAuth,
+              onLogout: _logout,
+            );
+          }
+
+          // user mode
+          return GateOpsShell(
+            username: session.username!,
+            onLogout: _logout,
           );
         },
       ),
@@ -187,2736 +297,208 @@ class _GateOpsAppState extends State<GateOpsApp> {
   }
 }
 
-class ThemeScope extends InheritedWidget {
-  const ThemeScope({super.key, required this.mode, required super.child});
-  final ValueNotifier<ThemeMode> mode;
+/* =========================================================
+   SCREENS: MASTER SETUP / LOGIN / ADMIN
+========================================================= */
 
-  static ValueNotifier<ThemeMode> of(BuildContext context) {
-    final scope = context.dependOnInheritedWidgetOfExactType<ThemeScope>();
-    return scope!.mode;
+class MasterSetupScreen extends StatefulWidget {
+  final VoidCallback onDone;
+  const MasterSetupScreen({super.key, required this.onDone});
+
+  @override
+  State<MasterSetupScreen> createState() => _MasterSetupScreenState();
+}
+
+class _MasterSetupScreenState extends State<MasterSetupScreen> {
+  final p1 = TextEditingController();
+  final p2 = TextEditingController();
+
+  void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  void _save() {
+    final a = p1.text;
+    final b = p2.text;
+    if (a != b) return _toast('Şifreler aynı değil.');
+    if (!PasswordPolicy.validate(a)) return _toast(PasswordPolicy.hint());
+
+    final salt = CryptoUtil.genSaltB64();
+    final hash = CryptoUtil.hashB64Func(salt, a);
+
+    final data = AuthData(master: MasterSecret(saltB64: salt, hashB64: hash), users: const []);
+    AuthStore.save(data);
+    widget.onDone();
   }
 
   @override
-  bool updateShouldNotify(ThemeScope oldWidget) => oldWidget.mode != mode;
-}
-
-
-class _AuthGate extends StatelessWidget {
-  const _AuthGate();
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<User?>(
-      stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, snap) {
-        if (snap.connectionState == ConnectionState.waiting) {
-          return const _Splash();
-        }
-        if (snap.data == null) {
-          return const LoginScreen();
-        }
-        final uid = snap.data!.uid;
-        return FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          future: FirebaseFirestore.instance.collection('users').doc(uid).get(),
-          builder: (context, userSnap) {
-            final night = (userSnap.data?.data()?['nightMode'] ?? false) == true;
-            final mode = ThemeScope.of(context);
-            final desired = night ? ThemeMode.dark : ThemeMode.light;
-            if (mode.value != desired) {
-              // ignore: avoid_setstate_in_build
-              mode.value = desired;
-            }
-            return const HomeShell();
-          },
-        );
-      },
-    );
+  void dispose() {
+    p1.dispose();
+    p2.dispose();
+    super.dispose();
   }
-}
-
-class _Splash extends StatelessWidget {
-  const _Splash();
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 12),
-            Text('GateOps is loading...'),
-          ],
-        ),
+    return Scaffold(
+      appBar: AppBar(title: const Text('İlk Kurulum • Master Şifre')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            'İlk kurulum: Master şifreyi bir kez oluşturacaksın.\n'
+            'Sonrasında Admin Mode ile kullanıcıları (user) ekleyeceksin.',
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: p1,
+            obscureText: true,
+            decoration: const InputDecoration(labelText: 'Master şifre'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: p2,
+            obscureText: true,
+            decoration: const InputDecoration(labelText: 'Master şifre (tekrar)'),
+          ),
+          const SizedBox(height: 8),
+          Text(PasswordPolicy.hint()),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(onPressed: _save, icon: const Icon(Icons.lock), label: const Text('Master Şifreyi Oluştur')),
+          const SizedBox(height: 12),
+          TextButton(
+            onPressed: () {
+              // Intentional: nothing
+            },
+            child: const Text(''),
+          ),
+        ],
       ),
     );
   }
 }
-
-// -------------------------
-// Models
-// -------------------------
-
-enum PaxTag { dft, pre }
-
-enum PaxStatus { active, offloaded }
-
-
-class _ParsedScan {
-  final String raw;
-  final String flightCode;
-  final String seat;
-  final String surname;
-  final String givenName;
-  final String fullName;
-  final bool isBCBP;
-
-  const _ParsedScan({
-    required this.raw,
-    required this.flightCode,
-    required this.seat,
-    required this.surname,
-    required this.givenName,
-    required this.fullName,
-    required this.isBCBP,
-  });
-}
-
-
-class Pax {
-  Pax({
-    required this.id,
-    required this.flightCode,
-    required this.fullName,
-    required this.surname,
-    required this.givenName,
-    required this.seat,
-    required this.tag,
-    required this.status,
-    required this.isInfant,
-    required this.scannedAt,
-    required this.lastEvent,
-    this.boardedByUid = '',
-    this.boardedAt,
-    this.offloadedByUid = '',
-    this.offloadedAt,
-    this.lastActionByUid = '',
-    this.lastActionAt,
-    this.source = 'scan',
-  });
-
-  final String id;
-  final String flightCode;
-  final String fullName;
-  final String surname;
-  final String givenName;
-  final String seat;
-  final PaxTag tag;
-  final PaxStatus status;
-  final bool isInfant;
-  final DateTime scannedAt;
-  final String lastEvent; // dft/pre/offloaded/reinstated/manual
-
-  // audit
-  final String boardedByUid;
-  final DateTime? boardedAt;
-  final String offloadedByUid;
-  final DateTime? offloadedAt;
-  final String lastActionByUid;
-  final DateTime? lastActionAt;
-  final String source; // scan/manual
-
-  Map<String, dynamic> toMap() {
-    return {
-      'flightCode': flightCode,
-      'fullName': fullName,
-      'surname': surname,
-      'givenName': givenName,
-      'seat': seat,
-      'tag': tag.name,
-      'status': status == PaxStatus.offloaded ? 'offloaded' : 'active',
-      'isInfant': isInfant,
-      'scannedAt': Timestamp.fromDate(scannedAt),
-      'lastEvent': lastEvent,
-      'boardedByUid': boardedByUid,
-      'boardedAt': boardedAt == null ? null : Timestamp.fromDate(boardedAt!),
-      'offloadedByUid': offloadedByUid,
-      'offloadedAt': offloadedAt == null ? null : Timestamp.fromDate(offloadedAt!),
-      'lastActionByUid': lastActionByUid,
-      'lastActionAt': lastActionAt == null ? null : Timestamp.fromDate(lastActionAt!),
-      'source': source,
-      'updatedAt': FieldValue.serverTimestamp(),
-    };
-  }
-
-  static Pax fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
-    final d = doc.data() ?? <String, dynamic>{};
-    return Pax(
-      id: doc.id,
-      flightCode: (d['flightCode'] ?? '') as String,
-      fullName: (d['fullName'] ?? '') as String,
-      surname: (d['surname'] ?? '') as String,
-      givenName: (d['givenName'] ?? '') as String,
-      seat: (d['seat'] ?? '') as String,
-      tag: ((d['tag'] ?? 'dft') as String) == 'pre' ? PaxTag.pre : PaxTag.dft,
-      status: ((d['status'] ?? 'active') as String) == 'offloaded' ? PaxStatus.offloaded : PaxStatus.active,
-      isInfant: (d['isInfant'] ?? false) as bool,
-      scannedAt: ((d['scannedAt'] as Timestamp?)?.toDate()) ?? DateTime.fromMillisecondsSinceEpoch(0),
-      lastEvent: (d['lastEvent'] ?? '') as String,
-      boardedByUid: (d['boardedByUid'] ?? '') as String,
-      boardedAt: ((d['boardedAt'] as Timestamp?)?.toDate()),
-      offloadedByUid: (d['offloadedByUid'] ?? '') as String,
-      offloadedAt: ((d['offloadedAt'] as Timestamp?)?.toDate()),
-      lastActionByUid: (d['lastActionByUid'] ?? '') as String,
-      lastActionAt: ((d['lastActionAt'] as Timestamp?)?.toDate()),
-      source: (d['source'] ?? 'scan') as String,
-    );
-  }
-}
-
-
-enum EquipmentType { table, desk, etd }
-
-enum EtdModel { is600, itemiser4dx }
-
-class EquipmentItem {
-  EquipmentItem({
-    required this.id,
-    required this.type,
-    required this.serials,
-    this.etdModel,
-  });
-
-  final String id;
-  final EquipmentType type;
-  final List<String> serials;
-  final EtdModel? etdModel;
-
-  Map<String, dynamic> toMap() {
-    return {
-      'type': type.name,
-      'serials': serials,
-      'etdModel': etdModel?.name,
-      'updatedAt': FieldValue.serverTimestamp(),
-    };
-  }
-
-  static EquipmentItem fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
-    final d = doc.data() ?? <String, dynamic>{};
-    final typeStr = (d['type'] ?? 'table') as String;
-    final modelStr = d['etdModel'] as String?;
-    return EquipmentItem(
-      id: doc.id,
-      type: EquipmentType.values.firstWhere((e) => e.name == typeStr, orElse: () => EquipmentType.table),
-      serials: ((d['serials'] ?? const <dynamic>[]) as List).map((e) => e.toString()).toList(),
-      etdModel: modelStr == null
-          ? null
-          : EtdModel.values.firstWhere((e) => e.name == modelStr, orElse: () => EtdModel.is600),
-    );
-  }
-
-  String label() {
-    switch (type) {
-      case EquipmentType.table:
-        return 'Masa';
-      case EquipmentType.desk:
-        return 'Desk';
-      case EquipmentType.etd:
-        final m = (etdModel ?? EtdModel.is600) == EtdModel.is600 ? 'IS600' : 'Itemiser 4DX';
-        return 'ETD ($m)';
-    }
-    // Unreachable, but keeps analyzer happy for non-nullable return.
-    return type.name;
-  }
-}
-
-class Personnel {
-  Personnel({required this.id, required this.name, required this.title});
-  final String id;
-  final String name;
-  final String title;
-
-  Map<String, dynamic> toMap() {
-    return {
-      'name': name,
-      'title': title,
-      'updatedAt': FieldValue.serverTimestamp(),
-    };
-  }
-
-  static Personnel fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
-    final d = doc.data() ?? <String, dynamic>{};
-    return Personnel(id: doc.id, name: (d['name'] ?? '') as String, title: (d['title'] ?? '') as String);
-  }
-}
-
-// -------------------------
-// Helpers
-// -------------------------
-
-String usernameToEmail(String username) {
-  final u = username.trim().toLowerCase();
-  if (u.contains('@')) return u;
-  return '$u@gozen.local';
-}
-
-bool isStrongPassword(String pwd) {
-  if (pwd.length < 8) return false;
-  final hasUpper = RegExp(r'[A-Z]').hasMatch(pwd);
-  final hasLower = RegExp(r'[a-z]').hasMatch(pwd);
-  final hasDigit = RegExp(r'\d').hasMatch(pwd);
-  final hasPunct = RegExp(r'[^A-Za-z0-9]').hasMatch(pwd);
-  return hasUpper && hasLower && hasDigit && hasPunct;
-}
-
-String sanitizeKey(String input) {
-  final s = input.trim();
-  return s.replaceAll(RegExp(r'[^A-Za-z0-9_\-]'), '_');
-}
-
-String normalizeSeat(String seat) {
-  final s = seat.trim().toUpperCase();
-  return s.replaceAll(RegExp(r'\s+'), '');
-}
-
-// Best-effort barcode payload parser.
-// Returns a map with fields: flightCode, surname, givenName, seat.
-// Supports:
-// - Our legacy mock format: FLIGHT|SURNAME/NAME|SEAT
-// - Common IATA BCBP text: starts with 'M1' or contains airline flight + name + seat (heuristics)
-Map<String, String> parseBoardingPayload(String raw) {
-  final text = raw.trim();
-
-  // 1) mock
-  if (text.contains('|')) {
-    final parts = text.split('|');
-    if (parts.length >= 3) {
-      final flight = parts[0].trim();
-      final namePart = parts[1].trim();
-      final seat = normalizeSeat(parts[2]);
-      String surname = '';
-      String given = '';
-      if (namePart.contains('/')) {
-        final np = namePart.split('/');
-        surname = np[0].trim();
-        given = np.sublist(1).join(' ').trim();
-      } else {
-        surname = namePart;
-      }
-      return {
-        'flightCode': flight,
-        'surname': surname,
-        'givenName': given,
-        'seat': seat,
-      };
-    }
-  }
-
-  // 2) IATA BCBP (very rough heuristics)
-  // BCBP is often 60/70/80 chars and begins with 'M' then number.
-  if (text.length >= 20 && (text.startsWith('M') || text.startsWith('m'))) {
-    // Surname/given are usually around positions 2..22 until padding with spaces.
-    final nameChunk = text.substring(2, text.length.clamp(2, 24)).trim();
-    String surname = nameChunk;
-    String given = '';
-    if (nameChunk.contains('/')) {
-      final np = nameChunk.split('/');
-      surname = np[0].trim();
-      given = np.sublist(1).join(' ').trim();
-    }
-
-    // Flight number usually appears later; try a regex for 2 letters + 3-4 digits.
-    final flightMatch = RegExp(r'([A-Z0-9]{2})\s?(\d{3,4})').firstMatch(text.toUpperCase());
-    final flight = flightMatch == null ? '' : '${flightMatch.group(1)}${flightMatch.group(2)}';
-
-    // Seat: often 3 chars like 12A appears near end; find last seat-like token.
-    final seatMatches = RegExp(r'(\d{1,2}[A-Z])').allMatches(text.toUpperCase()).toList();
-    final seat = seatMatches.isEmpty ? '' : normalizeSeat(seatMatches.last.group(1) ?? '');
-
-    return {
-      'flightCode': flight,
-      'surname': surname,
-      'givenName': given,
-      'seat': seat,
-    };
-  }
-
-  // fallback: try extract seat
-  final seatMatches = RegExp(r'(\d{1,2}[A-Z])').allMatches(text.toUpperCase()).toList();
-  final seat = seatMatches.isEmpty ? '' : normalizeSeat(seatMatches.last.group(1) ?? '');
-  return {
-    'flightCode': '',
-    'surname': '',
-    'givenName': '',
-    'seat': seat,
-  };
-}
-
-// -------------------------
-// Login
-// -------------------------
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  final AuthData auth;
+  final VoidCallback onAuthChanged;
+  final void Function(String username) onUserLogin;
+  final VoidCallback onAdminLogin;
+
+  const LoginScreen({
+    super.key,
+    required this.auth,
+    required this.onAuthChanged,
+    required this.onUserLogin,
+    required this.onAdminLogin,
+  });
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen> {
-  final _username = TextEditingController();
-  final _password = TextEditingController();
-  bool _busy = false;
-  bool _offlineMode = false;
-  bool _obscure = true;
+class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStateMixin {
+  late final TabController tab;
 
-  @override
-  void dispose() {
-    _username.dispose();
-    _password.dispose();
-    super.dispose();
-  }
+  final userCtrl = TextEditingController();
+  final passCtrl = TextEditingController();
 
-  Future<void> _login() async {
-    final username = _username.text.trim();
-    final pwd = _password.text;
-
-    if (username.isEmpty || pwd.isEmpty) {
-      _toast('Kullanici adi ve sifre gerekli.');
-      return;
-    }
-
-    setState(() => _busy = true);
-    try {
-      await FirebaseAuth.instance.signInWithEmailAndPassword(email: usernameToEmail(username), password: pwd);
-      final uid = FirebaseAuth.instance.currentUser?.uid;
-      if (uid != null) {
-        await FirebaseFirestore.instance.collection('users').doc(uid).set({
-          'displayName': username.trim(),
-          'email': usernameToEmail(username),
-          'nightMode': false,
-          'isAdmin': false,
-          'updatedAt': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
-      }
-    } on FirebaseAuthException catch (e) {
-      _toast(_prettyAuthError(e));
-    } catch (_) {
-      _toast('Giris basarisiz.');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  String _prettyAuthError(FirebaseAuthException e) {
-    switch (e.code) {
-      case 'invalid-credential':
-      case 'wrong-password':
-        return 'Sifre hatali.';
-      case 'user-not-found':
-        return 'Kullanici bulunamadi.';
-      case 'invalid-email':
-        return 'Kullanici adi / email gecersiz.';
-      case 'too-many-requests':
-        return 'Cok fazla deneme. Biraz bekleyin.';
-      default:
-        return 'Giris hatasi: ${e.code}';
-    }
-  }
-
-  void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(18),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 420),
-              child: Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(18),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Row(
-                        children: [
-                          Container(
-                            width: 44,
-                            height: 44,
-                            decoration: BoxDecoration(
-                              color: cs.primary,
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                            child: const Icon(Icons.flight_takeoff_rounded, color: Colors.white),
-                          ),
-                          const SizedBox(width: 12),
-                          const Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text('GateOps', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
-                                SizedBox(height: 2),
-                                Text('Cloud Sync • Internal', style: TextStyle(color: Colors.black54)),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 16),
-                      TextField(
-                        controller: _username,
-                        textInputAction: TextInputAction.next,
-                        decoration: const InputDecoration(
-                          labelText: 'Kullanici Adi (isim.soyisim)',
-                          prefixIcon: Icon(Icons.person_rounded),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _password,
-                        obscureText: _obscure,
-                        onSubmitted: (_) => _login(),
-                        decoration: InputDecoration(
-                          labelText: 'Sifre',
-                          prefixIcon: const Icon(Icons.lock_rounded),
-                          suffixIcon: IconButton(
-                            onPressed: () => setState(() => _obscure = !_obscure),
-                            icon: Icon(_obscure ? Icons.visibility_rounded : Icons.visibility_off_rounded),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 14),
-                      SizedBox(
-                        width: double.infinity,
-                        height: 48,
-                        child: FilledButton(
-                          onPressed: _busy ? null : _login,
-                          child: _busy
-                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                              : const Text('Giris Yap'),
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      const Text(
-                        'Not: Kullanicilar Firebase Console > Authentication tarafindan olusturulur.\nSifre kurali: en az 8 karakter, buyuk/kucuk harf, rakam, noktalama.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.black54, fontSize: 12),
-                      ),
-                      const SizedBox(height: 6),
-                      TextButton(
-                        onPressed: () {
-                          showDialog(
-                            context: context,
-                            builder: (_) => const _PasswordRuleDialog(),
-                          );
-                        },
-                        child: const Text('Sifre kurallari'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _PasswordRuleDialog extends StatelessWidget {
-  const _PasswordRuleDialog();
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Sifre Kurallari'),
-      content: const Text('Min 8 karakter. Buyuk harf, kucuk harf, rakam ve noktalama icermelidir.'),
-      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Tamam'))],
-    );
-  }
-}
-
-// -------------------------
-// Home shell
-// -------------------------
-
-class HomeShell extends StatefulWidget {
-  const HomeShell({super.key});
-
-  @override
-  State<HomeShell> createState() => _HomeShellState();
-}
-
-class _HomeShellState extends State<HomeShell> {
-  String? _activeSessionId;
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance.collection('users').doc(FirebaseAuth.instance.currentUser!.uid).snapshots(),
-      builder: (context, snap) {
-        final data = snap.data?.data();
-        final role = (data?['role'] ?? 'user') as String;
-        final isAdmin = role == 'admin';
-
-        return Scaffold(
-          appBar: AppBar(
-            title: const Text('GateOps'),
-            actions: [
-              IconButton(
-                tooltip: 'Logout',
-                onPressed: () async {
-                  await FirebaseAuth.instance.signOut();
-                },
-                icon: const Icon(Icons.logout_rounded),
-              ),
-            ],
-          ),
-          body: _activeSessionId == null
-              ? _SessionPicker(
-                  isAdmin: isAdmin,
-                  onJoined: (sid) => setState(() => _activeSessionId = sid),
-                )
-              : FlightWorkspace(
-                  sessionId: _activeSessionId!,
-                  isAdmin: isAdmin,
-                  onExit: () => setState(() => _activeSessionId = null),
-                ),
-        );
-      },
-    );
-  }
-}
-
-// -------------------------
-// Session create/join
-// -------------------------
-
-class _SessionPicker extends StatefulWidget {
-  const _SessionPicker({required this.isAdmin, required this.onJoined});
-  final bool isAdmin;
-  final void Function(String sessionId) onJoined;
-
-  @override
-  State<_SessionPicker> createState() => _SessionPickerState();
-}
-
-class _SessionPickerState extends State<_SessionPicker> {
-  final _flight = TextEditingController();
-  final _gate = TextEditingController();
-  final _booked = TextEditingController(text: '0');
-  bool _busy = false;
-  bool _offlineMode = false;
-
-  @override
-  void dispose() {
-    _flight.dispose();
-    _gate.dispose();
-    _booked.dispose();
-    super.dispose();
-  }
-
-  Future<void> _createSession() async {
-    final flight = _flight.text.trim().toUpperCase();
-    final gate = _gate.text.trim().toUpperCase();
-    final booked = int.tryParse(_booked.text.trim()) ?? 0;
-
-    if (flight.isEmpty) {
-      _toast('Ucus kodu gerekli.');
-      return;
-    }
-
-    setState(() => _busy = true);
-    try {
-      final now = DateTime.now();
-      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final sid = '${sanitizeKey(flight)}_${sanitizeKey(gate.isEmpty ? 'G' : gate)}_${now.millisecondsSinceEpoch}';
-
-      await FirebaseFirestore.instance.collection('sessions').doc(sid).set({
-        'flightCode': flight,
-        'gate': gate,
-        'bookedPax': booked,
-        'offlinePreferred': _offlineMode,
-        'createdAt': FieldValue.serverTimestamp(),
-        'createdBy': FirebaseAuth.instance.currentUser!.uid,
-        'boardingFinished': false,
-      });
-
-      if (_offlineMode) { await FirebaseFirestore.instance.disableNetwork(); }
-      widget.onJoined(sid);
-    } catch (e) {
-      _toast('Session olusturulamadi.');
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _joinSession(String sid) async {
-    setState(() => _busy = true);
-    try {
-      final doc = await FirebaseFirestore.instance.collection('sessions').doc(sid).get();
-      if (!doc.exists) {
-        _toast('Session bulunamadi.');
-        return;
-      }
-      final preferOffline = (doc.data()?['offlinePreferred'] ?? false) == true;
-      if (_offlineMode || preferOffline) {
-        await FirebaseFirestore.instance.disableNetwork();
-      } else {
-        // ensure online
-        try { await FirebaseFirestore.instance.enableNetwork(); } catch (_) {}
-      }
-      widget.onJoined(sid);
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(14),
-              child: Column(
-                children: [
-                  const Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text('Ucus Oturumu', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _flight,
-                          textInputAction: TextInputAction.next,
-                          decoration: const InputDecoration(labelText: 'Ucus Kodu', prefixIcon: Icon(Icons.confirmation_number_rounded)),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: TextField(
-                          controller: _gate,
-                          textInputAction: TextInputAction.next,
-                          decoration: const InputDecoration(labelText: 'Gate', prefixIcon: Icon(Icons.meeting_room_rounded)),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: _booked,
-                    keyboardType: TextInputType.number,
-                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                    decoration: const InputDecoration(labelText: 'Booked Pax', prefixIcon: Icon(Icons.people_alt_rounded)),
-                  ),
-                  SwitchListTile(
-                    value: _offlineMode,
-                    onChanged: (v) => setState(() => _offlineMode = v),
-                    title: const Text('Offline mod'),
-                    subtitle: const Text('İnternet kesilirse kayıtlar cihazda sıraya alınır ve internet gelince senkronize olur.'),
-                    secondary: const Icon(Icons.cloud_off_rounded),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 48,
-                    child: FilledButton.icon(
-                      onPressed: _busy ? null : _createSession,
-                      icon: const Icon(Icons.add_circle_outline_rounded),
-                      label: _busy ? const Text('...') : const Text('Yeni Ucus Oturumu Olustur'),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text('Baska cihazlar alttaki listeden ayni oturuma katilabilir.', style: TextStyle(color: Colors.black54)),
-                ],
-              ),
-            ),
-          ),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: FirebaseFirestore.instance
-                  .collection('sessions')
-                  .orderBy('createdAt', descending: true)
-                  .limit(30)
-                  .snapshots(),
-              builder: (context, snap) {
-                final docs = snap.data?.docs ?? const [];
-                if (docs.isEmpty) {
-                  return const Center(child: Text('Henüz oturum yok.'));
-                }
-                return ListView.builder(
-                  itemCount: docs.length,
-                  itemBuilder: (context, i) {
-                    final d = docs[i].data();
-                    final sid = docs[i].id;
-                    final flight = (d['flightCode'] ?? '') as String;
-                    final gate = (d['gate'] ?? '') as String;
-                    final booked = (d['bookedPax'] ?? 0);
-                    final finished = (d['boardingFinished'] ?? false) as bool;
-                    return Card(
-                      child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: finished ? Colors.black87 : Theme.of(context).colorScheme.primary,
-                          child: Icon(finished ? Icons.check_rounded : Icons.flight_takeoff_rounded, color: Colors.white),
-                        ),
-                        title: Text('$flight  •  Gate $gate'),
-                        subtitle: Text('Booked: $booked  •  ID: ${sid.substring(0, sid.length.clamp(0, 18))}...'),
-                        trailing: FilledButton(
-                          onPressed: _busy ? null : () => _joinSession(sid),
-                          child: const Text('Katıl'),
-                        ),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// -------------------------
-// Flight Workspace
-// -------------------------
-
-class FlightWorkspace extends StatefulWidget {
-  const FlightWorkspace({super.key, required this.sessionId, required this.isAdmin, required this.onExit});
-  final String sessionId;
-  final bool isAdmin;
-  final VoidCallback onExit;
-
-  @override
-  State<FlightWorkspace> createState() => _FlightWorkspaceState();
-}
-
-class _FlightWorkspaceState extends State<FlightWorkspace> {
-  int _tab = 0;
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).snapshots(),
-      builder: (context, snap) {
-        final s = snap.data?.data();
-        if (s == null) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        final flight = (s['flightCode'] ?? '') as String;
-        final gate = (s['gate'] ?? '') as String;
-        final booked = (s['bookedPax'] ?? 0) as int;
-        final boardingFinished = (s['boardingFinished'] ?? false) as bool;
-
-        return Column(
-          children: [
-            _WorkspaceHeader(
-              sessionId: widget.sessionId,
-              flight: flight,
-              gate: gate,
-              booked: booked,
-              boardingFinished: boardingFinished,
-              isAdmin: widget.isAdmin,
-              onExit: widget.onExit,
-            ),
-            Expanded(
-              child: IndexedStack(
-                index: _tab,
-                children: [
-                  ScanTab(sessionId: widget.sessionId, flightCode: flight, booked: booked),
-                  ListsTab(sessionId: widget.sessionId, booked: booked),
-                  WatchlistTab(sessionId: widget.sessionId),
-                  EquipmentTab(sessionId: widget.sessionId),
-                  PersonnelTab(sessionId: widget.sessionId),
-                  TimesTab(sessionId: widget.sessionId),
-                  ExportTab(sessionId: widget.sessionId, flightCode: flight, gate: gate),
-                ],
-              ),
-            ),
-            _BottomNav(
-              index: _tab,
-              onChange: (i) => setState(() => _tab = i),
-            ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-class _WorkspaceHeader extends StatelessWidget {
-  const _WorkspaceHeader({
-    required this.sessionId,
-    required this.flight,
-    required this.gate,
-    required this.booked,
-    required this.boardingFinished,
-    required this.isAdmin,
-    required this.onExit,
-  });
-
-  final String sessionId;
-  final String flight;
-  final String gate;
-  final int booked;
-  final bool boardingFinished;
-  final bool isAdmin;
-  final VoidCallback onExit;
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Row(
-          children: [
-            Container(
-              width: 42,
-              height: 42,
-              decoration: BoxDecoration(color: cs.primary, borderRadius: BorderRadius.circular(14)),
-              child: const Icon(Icons.flight_rounded, color: Colors.white),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('$flight  •  Gate $gate', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
-                  const SizedBox(height: 2),
-                  Text('Booked Pax: $booked  •  Session: ${sessionId.substring(0, sessionId.length.clamp(0, 16))}...',
-                      style: const TextStyle(color: Colors.black54)),
-                ],
-              ),
-            ),
-            Column(
-              children: [
-                _Pill(
-                  icon: boardingFinished ? Icons.check_circle_rounded : Icons.timelapse_rounded,
-                  text: boardingFinished ? 'Finished' : 'Live',
-                  color: boardingFinished ? Colors.black87 : cs.primary,
-                ),
-                const SizedBox(height: 8),
-                IconButton(
-                  tooltip: 'Gece modu',
-                  onPressed: () async {
-                    final mode = ThemeScope.of(context);
-                    final next = mode.value == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
-                    mode.value = next;
-                    final uid = FirebaseAuth.instance.currentUser?.uid;
-                    if (uid != null) {
-                      await FirebaseFirestore.instance.collection('users').doc(uid).set({'nightMode': next == ThemeMode.dark}, SetOptions(merge: true));
-                    }
-                  },
-                  icon: const Icon(Icons.dark_mode_rounded),
-                ),
-                OutlinedButton.icon(
-                  onPressed: onExit,
-                  icon: const Icon(Icons.exit_to_app_rounded),
-                  label: const Text('Cikis'),
-                ),
-              ],
-            )
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _Pill extends StatelessWidget {
-  const _Pill({required this.icon, required this.text, required this.color});
-  final IconData icon;
-  final String text;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withAlpha((0.12 * 255).round()),
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: color.withAlpha((0.22 * 255).round())),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: color),
-          const SizedBox(width: 6),
-          Text(text, style: TextStyle(color: color, fontWeight: FontWeight.w800)),
-        ],
-      ),
-    );
-  }
-}
-
-class _BottomNav extends StatelessWidget {
-  const _BottomNav({required this.index, required this.onChange});
-  final int index;
-  final void Function(int) onChange;
-
-  @override
-  Widget build(BuildContext context) {
-    return NavigationBar(
-      selectedIndex: index,
-      onDestinationSelected: onChange,
-      destinations: const [
-        NavigationDestination(icon: Icon(Icons.qr_code_scanner_rounded), label: 'Scan'),
-        NavigationDestination(icon: Icon(Icons.list_alt_rounded), label: 'Lists'),
-        NavigationDestination(icon: Icon(Icons.visibility_rounded), label: 'Watch'),
-        NavigationDestination(icon: Icon(Icons.inventory_2_rounded), label: 'Equip'),
-        NavigationDestination(icon: Icon(Icons.badge_rounded), label: 'Personnel'),
-        NavigationDestination(icon: Icon(Icons.schedule_rounded), label: 'Times'),
-        NavigationDestination(icon: Icon(Icons.file_download_rounded), label: 'Export'),
-      ],
-    );
-  }
-}
-
-// -------------------------
-// Scan Tab
-// -------------------------
-
-class ScanTab extends StatefulWidget {
-  const ScanTab({super.key, required this.sessionId, required this.flightCode, required this.booked});
-  final String sessionId;
-  final String flightCode;
-  final int booked;
-
-  @override
-  State<ScanTab> createState() => _ScanTabState();
-}
-
-class _ScanTabState extends State<ScanTab> {
-  final MobileScannerController _scanner = MobileScannerController(
-    detectionSpeed: DetectionSpeed.noDuplicates,
-    facing: CameraFacing.back,
-  );
-
-  bool _cameraOn = true;
-  bool _busy = false;
-  String? _lastRaw;
-
-    Timer? _netTimer;
-  bool _offlineByPrompt = false;
-  bool _promptShowing = false;
+  final masterCtrl = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    // Scan ekranında internet kesilirse 1 dakikada bir offline mod teklif et
-    _netTimer = Timer.periodic(const Duration(minutes: 1), (_) => _checkNetAndOfferOffline());
-    // hızlı ilk kontrol
-    Future.delayed(const Duration(seconds: 3), _checkNetAndOfferOffline);
+    tab = TabController(length: 2, vsync: this);
   }
-
-  Future<bool> _hasInternet() async {
-    try {
-      final r = await InternetAddress.lookup('example.com');
-      return r.isNotEmpty && r.first.rawAddress.isNotEmpty;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<void> _checkNetAndOfferOffline() async {
-    if (!mounted) return;
-
-    // Only act if this tab/screen is currently visible to avoid framework asserts.
-    final route = ModalRoute.of(context);
-    if (route == null || route.isCurrent != true) return;
-
-    if (_offlineByPrompt) {
-      // offline moddayken internet geldi mi?
-      final ok = await _hasInternet();
-      if (ok) {
-        try {
-          await FirebaseFirestore.instance.enableNetwork();
-        } catch (_) {}
-        if (!mounted) return;
-        setState(() => _offlineByPrompt = false);
-        _toast('İnternet geldi. Senkronizasyon yapılıyor…');
-      }
-      return;
-    }
-
-    final ok = await _hasInternet();
-    if (ok) return;
-
-    if (_promptShowing) return;
-    _promptShowing = true;
-
-    // Delay to next frame to avoid calling showDialog during build/dispose phases.
-    await Future<void>.delayed(Duration.zero);
-    if (!mounted) {
-      _promptShowing = false;
-      return;
-    }
-    final r2 = ModalRoute.of(context);
-    if (r2 == null || r2.isCurrent != true) {
-      _promptShowing = false;
-      return;
-    }
-
-    bool? agree;
-    try {
-      agree = await showDialog<bool>(
-        context: context,
-        barrierDismissible: true,
-        builder: (c) => AlertDialog(
-          title: const Text('İnternet yok'),
-          content: const Text('Offline moda geçilsin mi? (İnternet gelince otomatik senkronize eder)'),
-          actions: [
-            TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text('Hayır')),
-            FilledButton(onPressed: () => Navigator.of(c).pop(true), child: const Text('Evet')),
-          ],
-        ),
-      );
-    } catch (_) {
-      // If dialog failed due to route changes, just ignore.
-    } finally {
-      _promptShowing = false;
-    }
-
-    if (agree == true) {
-      try {
-        await FirebaseFirestore.instance.disableNetwork();
-      } catch (_) {}
-      if (mounted) setState(() => _offlineByPrompt = true);
-      _toast('Offline mod aktif. Kayıtlar cihazda tutulacak.');
-    }
-  }
-
-@override
-  void dispose() {
-    _netTimer?.cancel();
-    _scanner.dispose();
-    super.dispose();
-  }
-
-  CollectionReference<Map<String, dynamic>> get _paxCol =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('pax');
-
-  DocumentReference<Map<String, dynamic>> _seatLockDoc(String seat) =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('seats').doc(seat);
-
-  Future<int> _countActiveBoarded() async {
-    final q = await _paxCol.where('status', isEqualTo: 'active').get();
-    return q.docs.length;
-  }
-
-  Stream<int> _activeCountStream() {
-    return _paxCol.where('status', isEqualTo: 'active').snapshots().map((s) => s.docs.length);
-  }
-
-  Stream<int> _dftCountStream() {
-    return _paxCol.where('status', isEqualTo: 'active').where('tag', isEqualTo: 'dft').snapshots().map((s) => s.docs.length);
-  }
-
-  Stream<bool> _boardingFinishedStream() {
-    return FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).snapshots().map((d) {
-      final data = d.data();
-      return (data?['boardingFinished'] ?? false) as bool;
-    });
-  }
-
-  
-  Future<void> _handleBarcode(String raw) async {
-    if (_busy) return;
-    setState(() => _busy = true);
-    _lastRaw = raw;
-
-    try {
-      // 1) Parse
-      final parsed = _parseFromRaw(raw) ?? await _manualEntryDialog(raw);
-      if (parsed == null) {
-        _toast('Kart okunamadı. Manuel giriş yapabilirsiniz.');
-        return;
-      }
-
-      // 2) Flight must match current session flight
-      final expected = _normalizeFlight(widget.flightCode);
-      final got = _normalizeFlight(parsed.flightCode);
-      if (expected.isNotEmpty && got.isNotEmpty && expected != got) {
-        _toast('Farklı uçuş: $got (beklenen $expected)');
-        return;
-      }
-
-      // 3) Choose action
-      final tag = await _pickTypeDialog(parsed);
-      if (tag == null) return;
-
-      // 4) Save
-      await _saveScan(parsed, tag: tag, forceInfant: false);
-
-      final matched = await _maybeWatchlistAlert(parsed.fullName);
-      if (!matched) {
-        await _showSuccessScreen(
-          tag == PaxTag.dft ? 'DFT OK' : 'PRE OK',
-          'Seat: ${_normalizeSeat(parsed.seat)}',
-        );
-      }
-} on _SeatDuplicateException catch (e) {
-      final proceed = await _confirm(
-        'Mükerrer Seat',
-        'Bu uçuşta aynı seat (infant hariç) olamaz.\n'
-        'Seat: ${e.seat}\n\n'
-        'Bu yolcuyu INFANT olarak kaydetmek ister misin?',
-      );
-      if (proceed) {
-        final parsed = _parseFromRaw(_lastRaw ?? '') ?? await _manualEntryDialog(_lastRaw ?? '');
-        if (parsed != null) {
-          final tag = await _pickTypeDialog(parsed);
-          if (tag != null) {
-            await _saveScan(parsed, tag: tag, forceInfant: true);
-            _toast('INFANT kaydedildi: ${_normalizeSeat(parsed.seat)}');
-          }
-        }
-      }
-    } catch (e, st) {
-      showOpError(context, e, st);
-    } finally {
-      if (!mounted) return;
-      setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _saveScan(_ParsedScan parsed, {required PaxTag tag, required bool forceInfant}) async {
-    final seatNorm = _normalizeSeat(parsed.seat);
-    if (seatNorm.isEmpty) {
-      throw StateError('seat-empty');
-    }
-
-    final nowTs = Timestamp.now();
-    final paxId = '${nowTs.millisecondsSinceEpoch}_$seatNorm';
-    final paxDoc = _paxCol.doc(paxId);
-    final seatDoc = _seatLockDoc(seatNorm);
-    final sessionDoc = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
-
-    final pax = Pax(
-      id: paxId,
-      flightCode: _normalizeFlight(parsed.flightCode),
-      fullName: parsed.fullName,
-      surname: parsed.surname,
-      givenName: parsed.givenName,
-      seat: seatNorm,
-      tag: tag,
-      status: PaxStatus.active,
-      scannedAt: DateTime.now(),
-      lastEvent: tag == PaxTag.dft ? 'dft' : 'pre',
-      isInfant: forceInfant,
-    );
-
-    Future<void> offlineWrite() async {
-      // IMPORTANT: Firestore transactions do not work when network is unavailable.
-      // In offline mode we do best-effort local writes; duplicates may be resolved on sync.
-      await paxDoc.set(pax.toMap(), SetOptions(merge: true));
-      await seatDoc.set(
-        {
-          'seat': seatNorm,
-          'occupiedBy': paxId,
-          'occupiedAt': nowTs,
-          'isInfant': forceInfant,
-          'lastTag': tag.name,
-        },
-        SetOptions(merge: true),
-      );
-      // Don't attempt reads for firstPaxAt in offline mode; just update lastPaxAt.
-      await sessionDoc.set({'lastPaxAt': nowTs}, SetOptions(merge: true));
-    }
-
-    // If we already switched to offline-by-prompt, never run a transaction.
-    if (_offlineByPrompt) {
-      await offlineWrite();
-      return;
-    }
-
-    try {
-      await FirebaseFirestore.instance.runTransaction((tx) async {
-        // Transactions require all reads before any writes.
-        final seatSnap = await tx.get(seatDoc);
-        final sessionSnap = await tx.get(sessionDoc);
-
-        if (seatSnap.exists) {
-          final occupiedBy = (seatSnap.data()?['occupiedBy'] as String?) ?? '';
-          final isInfant = (seatSnap.data()?['isInfant'] as bool?) ?? false;
-          if (!forceInfant && !isInfant) {
-            throw _SeatDuplicateException(seatNorm, occupiedBy: occupiedBy);
-          }
-        }
-
-        // writes
-        tx.set(paxDoc, pax.toMap(), SetOptions(merge: true));
-        tx.set(
-          seatDoc,
-          {
-            'seat': seatNorm,
-            'occupiedBy': paxId,
-            'occupiedAt': nowTs,
-            'isInfant': forceInfant,
-            'lastTag': tag.name,
-          },
-          SetOptions(merge: true),
-        );
-
-        final sessionData = sessionSnap.data() as Map<String, dynamic>? ?? <String, dynamic>{};
-        if (sessionData['firstPaxAt'] == null) {
-          tx.set(sessionDoc, {'firstPaxAt': nowTs}, SetOptions(merge: true));
-        }
-        tx.set(sessionDoc, {'lastPaxAt': nowTs}, SetOptions(merge: true));
-      });
-    } on FirebaseException catch (e) {
-      // Typical when offline / transient Firestore outage.
-      if (e.code == 'unavailable' || e.code == 'network-error' || e.code == 'failed-precondition') {
-        await offlineWrite();
-        if (mounted) {
-          setState(() => _offlineByPrompt = true);
-        }
-        _toast('Firebase erişilemiyor. Kayıt offline olarak eklendi.');
-        return;
-      }
-      rethrow;
-    }
-  }
-
-  String _normalizeFlight(String v) {
-    final s = v.trim().toUpperCase().replaceAll(' ', '');
-    final m = RegExp(r'^([A-Z0-9]{2,3})(\d{1,5})$').firstMatch(s);
-    if (m == null) return s;
-    final carrier = m.group(1)!;
-    final num = m.group(2)!.replaceFirst(RegExp(r'^0+'), '');
-    return '$carrier$num';
-  }
-
-  
-String normalizeFullName(String v) {
-  final up = v.trim().toUpperCase();
-  if (up.isEmpty) return '';
-  // remove diacritics roughly + collapse spaces
-  final cleaned = up
-      .replaceAll(RegExp(r'[^A-ZÇĞİÖŞÜ0-9\s]'), ' ')
-      .replaceAll(RegExp(r'\s+'), ' ')
-      .trim();
-  return cleaned;
-}
-
-String _normalizeSeat(String v) {
-    var s = v.trim().toUpperCase().replaceAll(' ', '');
-    if (s.isEmpty) return '';
-    // common: 003A -> 3A
-    final m4 = RegExp(r'^(\d{1,3})([A-Z])$').firstMatch(s);
-    if (m4 != null) {
-      final num = m4.group(1)!.replaceFirst(RegExp(r'^0+'), '');
-      return '${num.isEmpty ? '0' : num}${m4.group(2)!}';
-    }
-    // try to find inside
-    final m = RegExp(r'\b(\d{1,3})([A-Z])\b').firstMatch(s);
-    if (m != null) {
-      final num = m.group(1)!.replaceFirst(RegExp(r'^0+'), '');
-      return '${num.isEmpty ? '0' : num}${m.group(2)!}';
-    }
-    return s;
-  }
-
-  _ParsedScan? _parseFromRaw(String raw) {
-    final v = raw.trim();
-    if (v.isEmpty) return null;
-
-    // BCBP raw (IATA) usually starts with 'M' and has fixed fields
-    if (v.length >= 60 && v[0] == 'M') {
-      try {
-        final nameField = v.substring(2, 22).trim(); // SURNAME/GIVEN
-        String surname = '';
-        String givenName = '';
-        if (nameField.contains('/')) {
-          final parts = nameField.split('/');
-          surname = parts[0].trim();
-          givenName = parts.sublist(1).join('/').trim();
-        } else {
-          surname = nameField.trim();
-        }
-
-        final carrier = v.substring(36, 39).trim();
-        final flightNum = v.substring(39, 44).trim();
-        final flightCode = _normalizeFlight('$carrier$flightNum');
-
-        final seatField = v.substring(48, 52).trim();
-        final seat = _normalizeSeat(seatField);
-
-        final fullName = (givenName.isEmpty) ? surname : '$givenName $surname';
-
-        if (seat.isEmpty || flightCode.isEmpty) return null;
-
-        return _ParsedScan(
-          raw: raw,
-          flightCode: flightCode,
-          seat: seat,
-          surname: surname,
-          givenName: givenName,
-          fullName: fullName,
-          isBCBP: true,
-        );
-      } catch (_) {
-        // fallthrough to heuristic
-      }
-    }
-
-    // Heuristic parsing for non-BCBP / vendor formats
-    final flightMatch = RegExp(r'\b([A-Z0-9]{2,3})\s*0?(\d{3,5})\b').firstMatch(v.toUpperCase());
-    final flightCode = flightMatch == null ? '' : _normalizeFlight('${flightMatch.group(1)}${flightMatch.group(2)}');
-
-    final seatMatch = RegExp(r'\b(\d{1,3}\s*[A-Z])\b').firstMatch(v.toUpperCase());
-    final seat = seatMatch == null ? '' : _normalizeSeat(seatMatch.group(1)!.replaceAll(' ', ''));
-
-    // Name heuristic (very unreliable)
-    String surname = '';
-    String givenName = '';
-    final nameMatch = RegExp(r'\b([A-Z]{2,})/([A-Z]{2,})\b').firstMatch(v.toUpperCase());
-    if (nameMatch != null) {
-      surname = nameMatch.group(1)!.trim();
-      givenName = nameMatch.group(2)!.trim();
-    }
-    final fullName = (givenName.isEmpty) ? surname : '$givenName $surname';
-
-    if (seat.isEmpty) return null;
-
-    return _ParsedScan(
-      raw: raw,
-      flightCode: flightCode,
-      seat: seat,
-      surname: surname,
-      givenName: givenName,
-      fullName: fullName,
-      isBCBP: false,
-    );
-  }
-
-  Future<PaxTag?> _pickTypeDialog(_ParsedScan parsed) async {
-    return showDialog<PaxTag>(
-      context: context,
-      builder: (_) {
-        return AlertDialog(
-          title: const Text('İşlem Türü'),
-          content: Text(
-            'Uçuş: ${parsed.flightCode.isEmpty ? widget.flightCode : parsed.flightCode}\n'
-            'Seat: ${_normalizeSeat(parsed.seat)}\n'
-            'İsim: ${parsed.fullName.isEmpty ? '-' : parsed.fullName}',
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Vazgeç')),
-            FilledButton(onPressed: () => Navigator.pop(context, PaxTag.dft), child: const Text('DFT')),
-            FilledButton(onPressed: () => Navigator.pop(context, PaxTag.pre), child: const Text('Pre')),
-          ],
-        );
-      },
-    );
-  }
-
-  Future<_ParsedScan?> _manualEntryDialog(String raw) async {
-    // Only open manual input if camera read failed / user wants override.
-    // If raw is non-empty but parsing failed, still allow manual entry.
-    final flightCtrl = TextEditingController(text: widget.flightCode);
-    final seatCtrl = TextEditingController();
-    final surnameCtrl = TextEditingController();
-    final givenCtrl = TextEditingController();
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (_) {
-        return AlertDialog(
-          title: const Text('Manuel Giriş'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(controller: flightCtrl, decoration: const InputDecoration(labelText: 'Uçuş Kodu (örn BA679)')),
-                const SizedBox(height: 8),
-                TextField(controller: seatCtrl, decoration: const InputDecoration(labelText: 'Seat (örn 3A)')),
-                const SizedBox(height: 8),
-                TextField(controller: givenCtrl, decoration: const InputDecoration(labelText: 'Ad')),
-                const SizedBox(height: 8),
-                TextField(controller: surnameCtrl, decoration: const InputDecoration(labelText: 'Soyad')),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Vazgeç')),
-            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Kaydet')),
-          ],
-        );
-      },
-    );
-
-    if (ok != true) return null;
-
-    final flight = _normalizeFlight(flightCtrl.text);
-    final seat = _normalizeSeat(seatCtrl.text);
-    final surname = surnameCtrl.text.trim().toUpperCase();
-    final givenName = givenCtrl.text.trim().toUpperCase();
-    final fullName = ((givenName.isEmpty && surname.isEmpty) ? '' : '$givenName $surname').trim();
-
-    if (seat.isEmpty) return null;
-
-    return _ParsedScan(
-      raw: raw,
-      flightCode: flight.isEmpty ? _normalizeFlight(widget.flightCode) : flight,
-      seat: seat,
-      surname: surname,
-      givenName: givenName,
-      fullName: fullName,
-      isBCBP: false,
-    );
-  }
-
-Future<void> _forceAddAsInfant() async {
-    final raw = _lastRaw;
-    if (raw == null) return;
-    final parsed = parseBoardingPayload(raw);
-    final surname = (parsed['surname'] ?? '').trim();
-    final given = (parsed['givenName'] ?? '').trim();
-    final seat = normalizeSeat(parsed['seat'] ?? '');
-    final namePreview = (surname.isEmpty && given.isEmpty) ? '(isim okunamadi)' : '$surname $given'.trim();
-
-    final tag = await showDialog<PaxTag>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Override'),
-        content: const Text('Mükerrer seat override için yolcu INFANT olarak kaydedilecek. Etiket seç:'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Vazgec')),
-          FilledButton(onPressed: () => Navigator.pop(context, PaxTag.dft), child: const Text('DFT')),
-          FilledButton(onPressed: () => Navigator.pop(context, PaxTag.pre), child: const Text('Pre')),
-        ],
-      ),
-    );
-    if (tag == null) return;
-
-    final pid = sanitizeKey('${seat}_${surname}_${given}'.toUpperCase());
-    await _paxCol.doc(pid).set(
-          Pax(
-            id: pid,
-            flightCode: widget.flightCode,
-            fullName: namePreview,
-            surname: surname,
-            givenName: given,
-            seat: seat,
-            tag: tag,
-            status: PaxStatus.active,
-            isInfant: true,
-            scannedAt: DateTime.now(),
-            lastEvent: 'scanned',
-          ).toMap(),
-          SetOptions(merge: true),
-        );
-
-    _toast('Override kaydedildi (INFANT): $seat');
-  }
-
-  Future<void> _offloadBySeat(String seat) async {
-    final normSeat = normalizeSeat(seat);
-    if (normSeat.isEmpty) return;
-
-    // Find active pax with seat
-    final q = await _paxCol.where('seat', isEqualTo: normSeat).where('status', isEqualTo: 'active').limit(5).get();
-    if (q.docs.isEmpty) {
-      _toast('Aktif yolcu bulunamadi: $normSeat');
-      return;
-    }
-
-    final doc = q.docs.first;
-    final pax = Pax.fromDoc(doc);
-
-    final ok = await _confirm('Offload', '${pax.fullName} ($normSeat) offload?');
-    if (!ok) return;
-
-    await FirebaseFirestore.instance.runTransaction((tx) async {
-      tx.set(doc.reference, {'status': 'offloaded', 'lastEvent': 'offloaded', 'updatedAt': FieldValue.serverTimestamp()}, SetOptions(merge: true));
-
-      // Clear seat lock if this pax held it
-      if (!pax.isInfant) {
-        final seatDoc = _seatLockDoc(normSeat);
-        final seatSnap = await tx.get(seatDoc);
-        if (seatSnap.exists) {
-          final d = seatSnap.data() as Map<String, dynamic>;
-          final activeId = (d['activePaxId'] ?? '') as String;
-          if (activeId == pax.id) {
-            tx.set(seatDoc, {'active': false, 'activePaxId': '', 'updatedAt': FieldValue.serverTimestamp()}, SetOptions(merge: true));
-          }
-        }
-      }
-
-      final sessionDoc = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
-      tx.set(sessionDoc, {'lastPaxAt': Timestamp.fromDate(DateTime.now())}, SetOptions(merge: true));
-    });
-
-    _toast('Offload edildi: $normSeat');
-  }
-
-  Future<bool> _confirm(String title, String msg) async {
-    final res = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text(title),
-        content: Text(msg),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Hayir')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Evet')),
-        ],
-      ),
-    );
-    return res ?? false;
-  }
-
-  void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-
-    return SafeArea(
-      child: Column(
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Camera Scan', style: TextStyle(fontWeight: FontWeight.w900)),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _inviteUser,
-                          icon: const Icon(Icons.person_add_alt_1_rounded),
-                          label: const Text('Davet Et'),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _offlineByPrompt ? () async { try { await FirebaseFirestore.instance.enableNetwork(); } catch (_) {} setState(() => _offlineByPrompt = false); } : null,
-                          icon: const Icon(Icons.cloud_done_rounded),
-                          label: const Text('Online'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(18),
-                    child: AspectRatio(
-                      aspectRatio: 16 / 10,
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          if (_cameraOn)
-                            MobileScanner(
-                              controller: _scanner,
-                              onDetect: (capture) {
-                                final barcodes = capture.barcodes;
-                                if (barcodes.isEmpty) return;
-                                final raw = barcodes.first.rawValue;
-                                if (raw == null || raw.trim().isEmpty) return;
-                                _handleBarcode(raw);
-                              },
-                            )
-                          else
-                            Container(
-                              color: Colors.black12,
-                              child: const Center(child: Text('Camera kapali')),
-                            ),
-                          Positioned(
-                            left: 12,
-                            top: 12,
-                            right: 12,
-                            child: Row(
-                              children: [
-                                _Pill(icon: Icons.wifi_tethering_rounded, text: 'Cloud Sync', color: cs.primary),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                    decoration: BoxDecoration(
-                                      color: Colors.black.withAlpha((0.35 * 255).round()),
-                                      borderRadius: BorderRadius.circular(999),
-                                    ),
-                                    child: const Text(
-                                      'DFT = Randomly Selected',
-                                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                IconButton(
-                                  onPressed: () {
-                                    setState(() => _cameraOn = !_cameraOn);
-                                    if (_cameraOn) {
-                                      _scanner.start();
-                                    } else {
-                                      _scanner.stop();
-                                    }
-                                  },
-                                  icon: Icon(_cameraOn ? Icons.videocam_off_rounded : Icons.videocam_rounded, color: Colors.white),
-                                ),
-                              ],
-                            ),
-                          ),
-                          if (_busy)
-                            Container(
-                              color: Colors.black.withAlpha((0.15 * 255).round()),
-                              child: const Center(child: CircularProgressIndicator()),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: () async {
-                            final seat = await showDialog<String>(
-                              context: context,
-                              builder: (_) => const _ManualSeatDialog(title: 'Offload (Seat gir)', hint: '12A'),
-                            );
-                            if (seat == null) return;
-                            await _offloadBySeat(seat);
-                          },
-                          icon: const Icon(Icons.person_remove_alt_1_rounded),
-                          label: const Text('Manual Offload'),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: FilledButton.icon(
-                          onPressed: () async {
-                            // Boarding finished toggle
-                            final sessionRef = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
-                            final snap = await sessionRef.get();
-                            final finished = (snap.data()?['boardingFinished'] ?? false) as bool;
-                            final ok = await _confirm('Boarding Finished', finished ? 'Finish geri alinsin mi?' : 'Boarding Finished yapilsin mi?');
-                            if (!ok) return;
-                            await sessionRef.set({'boardingFinished': !finished, 'boardingFinishedAt': !finished ? Timestamp.fromDate(DateTime.now()) : null}, SetOptions(merge: true));
-
-                            if (!context.mounted) return;
-                            _toast(!finished ? 'Boarding Finished' : 'Boarding Finished geri alindi');
-                          },
-                          icon: const Icon(Icons.done_all_rounded),
-                          label: const Text('Boarding Finished'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: StreamBuilder<bool>(
-                      stream: _boardingFinishedStream(),
-                      builder: (context, snapBF) {
-                        final finished = snapBF.data ?? false;
-                        return StreamBuilder<int>(
-                          stream: _dftCountStream(),
-                          builder: (context, snapD) {
-                            final dft = snapD.data ?? 0;
-                            return StreamBuilder<int>(
-                              stream: _activeCountStream(),
-                              builder: (context, snapA) {
-                                final active = snapA.data ?? 0;
-                                final denom = finished ? (active == 0 ? 1 : active) : (widget.booked == 0 ? 1 : widget.booked);
-                                final ratio = dft / denom;
-                                final pct = (ratio * 100).clamp(0, 999).toStringAsFixed(1);
-                                final label = finished
-                                    ? 'DFT / Boarded = $dft / $active'
-                                    : 'DFT / Booked = $dft / ${widget.booked}';
-                                return Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
-                                    const SizedBox(height: 6),
-                                    LinearProgressIndicator(value: denom == 0 ? 0 : (dft / denom).clamp(0, 1)),
-                                    const SizedBox(height: 6),
-                                    Text('Oran: %$pct', style: const TextStyle(color: Colors.black54)),
-                                  ],
-                                );
-                              },
-                            );
-                          },
-                        );
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  
-  Future<void> _inviteUser() async {
-    if (!mounted) return;
-    final route = ModalRoute.of(context);
-    if (route == null || route.isCurrent != true) return;
-
-    final ctl = TextEditingController();
-    try {
-      // Defer to next frame to avoid framework asserts.
-      await Future<void>.delayed(Duration.zero);
-      if (!mounted) return;
-
-      final name = await showDialog<String>(
-        context: context,
-        barrierDismissible: true,
-        builder: (c) => AlertDialog(
-          title: const Text('Kullanıcı Davet Et'),
-          content: TextField(
-            controller: ctl,
-            decoration: const InputDecoration(
-              hintText: 'isim soyisim',
-              labelText: 'Kullanıcı',
-            ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.of(c).pop(), child: const Text('İptal')),
-            FilledButton(onPressed: () => Navigator.of(c).pop(ctl.text.trim()), child: const Text('Davet Et')),
-          ],
-        ),
-      );
-
-      final v = (name ?? '').trim();
-      if (v.isEmpty) return;
-
-      // If offline, don't attempt to invite (needs server read + write).
-      final okNet = await _hasInternet();
-      if (!okNet || _offlineByPrompt) {
-        _toast('Offline modda davet gönderilemez. İnternet gelince tekrar deneyin.');
-        return;
-      }
-
-      final qs = await FirebaseFirestore.instance.collection('users').where('displayName', isEqualTo: v).limit(1).get();
-      if (qs.docs.isEmpty) {
-        _toast('Kullanıcı bulunamadı: $v');
-        return;
-      }
-      final invitedUid = qs.docs.first.id;
-
-      final me = FirebaseAuth.instance.currentUser?.uid ?? '';
-      final sref = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
-
-      try {
-        await FirebaseFirestore.instance.runTransaction((tx) async {
-          final sdoc = await tx.get(sref);
-          final createdBy = (sdoc.data()?['createdByUid'] ?? '') as String;
-          final myUser = await tx.get(FirebaseFirestore.instance.collection('users').doc(me));
-          final isAdmin = (myUser.data()?['isAdmin'] ?? false) == true;
-
-          if (!isAdmin && createdBy != me) {
-            throw Exception('only owner/admin');
-          }
-
-          final allowed = (sdoc.data()?['allowedUids'] as List?)?.cast<String>() ?? <String>[];
-          if (!allowed.contains(invitedUid)) allowed.add(invitedUid);
-
-          tx.set(sref, {'allowedUids': allowed}, SetOptions(merge: true));
-          tx.set(sref.collection('events').doc(), {
-            'type': 'invite',
-            'invitedUid': invitedUid,
-            'invitedName': v,
-            'actorUid': me,
-            'at': FieldValue.serverTimestamp(),
-          });
-        });
-      } on FirebaseException catch (e) {
-        if (e.code == 'unavailable' || e.code == 'network-error') {
-          _toast('Firebase geçici olarak erişilemiyor. Lütfen tekrar deneyin.');
-          return;
-        }
-        rethrow;
-      }
-
-      _toast('Davet gönderildi: $v');
-    } catch (e) {
-      _toast('Davet başarısız: $e');
-    } finally {
-      ctl.dispose();
-    }
-  }
-
-
-Future<bool> _maybeWatchlistAlert(String fullName) async {
-    final norm = normalizeFullName(fullName);
-    if (norm.isEmpty) return false;
-
-    try {
-      final q = await FirebaseFirestore.instance.collection('watchlist').where('fullNameNorm', isEqualTo: norm).limit(1).get();
-      if (q.docs.isEmpty) return false;
-
-      // log
-      try {
-        final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-        await FirebaseFirestore.instance
-            .collection('sessions')
-            .doc(widget.sessionId)
-            .collection('events')
-            .add({
-          'type': 'watchlist_match',
-          'fullName': fullName,
-          'fullNameNorm': norm,
-          'actorUid': uid,
-          'at': FieldValue.serverTimestamp(),
-        });
-      } catch (_) {}
-
-      if (!mounted) return true;
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          fullscreenDialog: true,
-          builder: (_) => Scaffold(
-            backgroundColor: Colors.red.shade800,
-            body: SafeArea(
-              child: Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.warning_rounded, size: 110, color: Colors.white),
-                      const SizedBox(height: 16),
-                      const Text('WATCHLIST MATCH', textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.w900)),
-                      const SizedBox(height: 10),
-                      Text(norm, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
-                      const SizedBox(height: 20),
-                      FilledButton(
-                        onPressed: () => Navigator.of(context).pop(),
-                        style: FilledButton.styleFrom(backgroundColor: Colors.white),
-                        child: const Text('Kapat', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  Future<void> _showSuccessScreen(String title, String subtitle) async {
-    if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        fullscreenDialog: true,
-        builder: (_) => Scaffold(
-          backgroundColor: Colors.green.shade700,
-          body: SafeArea(
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.check_circle_rounded, size: 110, color: Colors.white),
-                    const SizedBox(height: 14),
-                    Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 18),
-                    FilledButton(
-                      onPressed: () => Navigator.of(context).pop(),
-                      style: FilledButton.styleFrom(backgroundColor: Colors.white),
-                      child: const Text('OK', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-}
-
-class _SeatDuplicateException implements Exception {
-  _SeatDuplicateException(this.seat, {this.occupiedBy = ''});
-  final String seat;
-  final String occupiedBy;
-}
-
-enum _ScanAction { dft, pre, offload }
-
-class _ScanDecision {
-  _ScanDecision({required this.action, required this.isInfant});
-  final _ScanAction action;
-  final bool isInfant;
-}
-
-class _ScanDecisionSheet extends StatefulWidget {
-  const _ScanDecisionSheet({required this.flightCode, required this.seat, required this.name});
-  final String flightCode;
-  final String seat;
-  final String name;
-
-  @override
-  State<_ScanDecisionSheet> createState() => _ScanDecisionSheetState();
-}
-
-class _ScanDecisionSheetState extends State<_ScanDecisionSheet> {
-  bool infant = false;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.only(
-        left: 16,
-        right: 16,
-        top: 8,
-        bottom: 16 + MediaQuery.of(context).viewInsets.bottom,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('${widget.flightCode}  •  Seat ${widget.seat}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
-          const SizedBox(height: 6),
-          Text(widget.name, style: const TextStyle(color: Colors.black54)),
-          const SizedBox(height: 12),
-          SwitchListTile.adaptive(
-            value: infant,
-            onChanged: (v) => setState(() => infant = v),
-            title: const Text('Infant yolcu (seat duplicate muaf)'),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: () => Navigator.pop(context, _ScanDecision(action: _ScanAction.dft, isInfant: infant)),
-                  icon: const Icon(Icons.search_rounded),
-                  label: const Text('DFT (Random)'),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: FilledButton.tonalIcon(
-                  onPressed: () => Navigator.pop(context, _ScanDecision(action: _ScanAction.pre, isInfant: infant)),
-                  icon: const Icon(Icons.how_to_reg_rounded),
-                  label: const Text('Pre-Board'),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: () => Navigator.pop(context, _ScanDecision(action: _ScanAction.offload, isInfant: false)),
-              icon: const Icon(Icons.person_remove_alt_1_rounded),
-              label: const Text('Offload (Bu seat)'),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ManualSeatDialog extends StatefulWidget {
-  const _ManualSeatDialog({required this.title, required this.hint});
-  final String title;
-  final String hint;
-
-  @override
-  State<_ManualSeatDialog> createState() => _ManualSeatDialogState();
-}
-
-class _ManualSeatDialogState extends State<_ManualSeatDialog> {
-  final _ctrl = TextEditingController();
 
   @override
   void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text(widget.title),
-      content: TextField(
-        controller: _ctrl,
-        decoration: InputDecoration(labelText: 'Seat', hintText: widget.hint),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
-        FilledButton(onPressed: () => Navigator.pop(context, _ctrl.text.trim()), child: const Text('Tamam')),
-      ],
-    );
-  }
-}
-
-// -------------------------
-// Lists Tab
-// -------------------------
-
-class ListsTab extends StatefulWidget {
-  const ListsTab({super.key, required this.sessionId, required this.booked});
-  final String sessionId;
-  final int booked;
-
-  @override
-  State<ListsTab> createState() => _ListsTabState();
-}
-
-class _ListsTabState extends State<ListsTab> {
-  final _query = TextEditingController();
-  String _q = '';
-
-  @override
-  void dispose() {
-    _query.dispose();
-    super.dispose();
-  }
-
-  CollectionReference<Map<String, dynamic>> get _paxCol =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('pax');
-  String _normalizeSeat(String seat) => normalizeSeat(seat);
-
-  DocumentReference<Map<String, dynamic>> _seatLockDoc(String seat) =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('seats').doc(seat);
-
-  Future<bool> _confirm(String title, String msg) async {
-    final res = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(title),
-        content: Text(msg),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')) ,
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Onay')),
-        ],
-      ),
-    );
-    return res == true;
-  }
-
-  Future<void> _showSuccessScreen(String title, String subtitle) async {
-    if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        fullscreenDialog: true,
-        builder: (_) => Scaffold(
-          backgroundColor: Colors.green.shade700,
-          body: SafeArea(
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.check_circle_rounded, size: 110, color: Colors.white),
-                    const SizedBox(height: 14),
-                    Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 18),
-                    FilledButton(
-                      onPressed: () => Navigator.of(context).pop(),
-                      style: FilledButton.styleFrom(backgroundColor: Colors.white),
-                      child: const Text('OK', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-
-  Stream<bool> _boardingFinishedStream() {
-    return FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).snapshots().map((d) {
-      final data = d.data();
-      return (data?['boardingFinished'] ?? false) as bool;
-    });
-  }
-
-  Stream<int> _activeCountStream() {
-    return _paxCol.where('status', isEqualTo: 'active').snapshots().map((s) => s.docs.length);
-  }
-
-  Stream<int> _dftCountStream() {
-    return _paxCol.where('status', isEqualTo: 'active').where('tag', isEqualTo: 'dft').snapshots().map((s) => s.docs.length);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _query,
-                    onChanged: (v) => setState(() => _q = v.trim().toLowerCase()),
-                    decoration: const InputDecoration(
-                      labelText: 'Ara: isim/soyisim veya seat',
-                      prefixIcon: Icon(Icons.search_rounded),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  StreamBuilder<bool>(
-                    stream: _boardingFinishedStream(),
-                    builder: (context, snapBF) {
-                      final finished = snapBF.data ?? false;
-                      return StreamBuilder<int>(
-                        stream: _dftCountStream(),
-                        builder: (context, snapD) {
-                          final dft = snapD.data ?? 0;
-                          return StreamBuilder<int>(
-                            stream: _activeCountStream(),
-                            builder: (context, snapA) {
-                              final active = snapA.data ?? 0;
-                              final denom = finished ? (active == 0 ? 1 : active) : (widget.booked == 0 ? 1 : widget.booked);
-                              final ratio = dft / denom;
-                              final pct = (ratio * 100).clamp(0, 999).toStringAsFixed(1);
-                              final label = finished
-                                  ? 'DFT / Boarded = $dft / $active'
-                                  : 'DFT / Booked = $dft / ${widget.booked}';
-                              return Row(
-                                children: [
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
-                                        const SizedBox(height: 6),
-                                        LinearProgressIndicator(value: denom == 0 ? 0 : (dft / denom).clamp(0, 1)),
-                                      ],
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Text('%$pct', style: const TextStyle(fontWeight: FontWeight.w900)),
-                                ],
-                              );
-                            },
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: _paxCol.orderBy('scannedAt', descending: true).limit(500).snapshots(),
-              builder: (context, snap) {
-                final docs = snap.data?.docs ?? const [];
-                final paxAll = docs.map(Pax.fromDoc).toList();
-
-                List<Pax> filtered = paxAll;
-                if (_q.isNotEmpty) {
-                  filtered = paxAll.where((p) {
-                    final s = '${p.fullName} ${p.seat}'.toLowerCase();
-                    return s.contains(_q);
-                  }).toList();
-                }
-
-                if (filtered.isEmpty) {
-                  return const Center(child: Text('Kayıt yok.'));
-                }
-
-                return ListView.builder(
-                  itemCount: filtered.length,
-                  itemBuilder: (context, i) {
-                    final p = filtered[i];
-                    final isActive = p.status == PaxStatus.active;
-                    final tagLabel = p.tag == PaxTag.dft ? 'DFT' : 'PRE';
-                    return Card(
-                      child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: p.tag == PaxTag.dft ? Theme.of(context).colorScheme.primary : Colors.black87,
-                          child: Text(tagLabel, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900)),
-                        ),
-                        title: Text(p.fullName.isEmpty ? '(isim yok)' : p.fullName, maxLines: 1, overflow: TextOverflow.ellipsis),
-                        subtitle: Text('Seat: ${p.seat}  •  ${isActive ? 'Active' : 'Offloaded'}  •  ${p.isInfant ? 'Infant' : 'Adult'}'),
-                        trailing: isActive
-                            ? OutlinedButton(
-                                onPressed: () async {
-                                  final ok = await showDialog<bool>(
-                                    context: context,
-                                    builder: (_) => AlertDialog(
-                                      title: const Text('Offload'),
-                                      content: Text('${p.fullName} (${p.seat}) offload?'),
-                                      actions: [
-                                        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Hayir')),
-                                        FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Evet')),
-                                      ],
-                                    ),
-                                  );
-                                  if (ok != true) return;
-                                  await _offloadPax(p);
-                                },
-                                child: const Text('Offload'),
-                              )
-                            : const Text(''),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _offloadPax(Pax p) async {
-    final normSeat = _normalizeSeat(p.seat);
-    final paxRef = _paxCol.doc(p.id);
-    final seatRef = _seatLockDoc(normSeat);
-
-    final ok = await _confirm('Offload', '${p.fullName} ($normSeat) offload?');
-    if (!ok) return;
-
-    final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-    final now = DateTime.now();
-
-    await FirebaseFirestore.instance.runTransaction((tx) async {
-      tx.set(
-        paxRef,
-        {
-          'status': 'offloaded',
-          'lastEvent': 'offloaded',
-          'offloadedByUid': uid,
-          'offloadedAt': Timestamp.fromDate(now),
-          'lastActionByUid': uid,
-          'lastActionAt': Timestamp.fromDate(now),
-          'updatedAt': FieldValue.serverTimestamp(),
-        },
-        SetOptions(merge: true),
-      );
-
-      // Seat lock kaldır: offload sonrası tekrar board mümkün olsun
-      tx.delete(seatRef);
-    });
-
-    if (mounted) {
-      await _showSuccessScreen('OFFLOAD OK', 'Seat: $normSeat');
-    }
-  }
-}
-
-
-// -------------------------
-// Watchlist Tab
-// -------------------------
-
-class WatchlistTab extends StatefulWidget {
-  const WatchlistTab({super.key, required this.sessionId});
-  final String sessionId;
-
-  @override
-  State<WatchlistTab> createState() => _WatchlistTabState();
-}
-
-class _WatchlistTabState extends State<WatchlistTab> {
-  final _name = TextEditingController();
-
-  @override
-  void dispose() {
-    _name.dispose();
+    tab.dispose();
+    userCtrl.dispose();
+    passCtrl.dispose();
+    masterCtrl.dispose();
     super.dispose();
   }
 
   void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
 
-  Future<void> _add() async {
-    final full = _name.text.trim();
-    if (full.isEmpty) return;
-    final norm = normalizeFullName(full);
-    if (norm.isEmpty) return;
+  void _userLogin() {
+    final u = UsernamePolicy.normalize(userCtrl.text);
+    final p = passCtrl.text;
 
-    final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
-    await FirebaseFirestore.instance.collection('watchlist').add({
-      'fullName': full,
-      'fullNameNorm': norm,
-      'createdByUid': uid,
-      'createdAt': FieldValue.serverTimestamp(),
-    });
-    _name.clear();
-    _toast('Watchlist eklendi');
+    if (!UsernamePolicy.validate(u)) return _toast(UsernamePolicy.hint());
+
+    final rec = widget.auth.users.where((e) => e.username == u).toList();
+    if (rec.isEmpty) return _toast('Kullanıcı bulunamadı.');
+
+    final r = rec.first;
+    final ok = CryptoUtil.hashB64Func(r.saltB64, p) == r.hashB64;
+    if (!ok) return _toast('Şifre yanlış.');
+
+    widget.onUserLogin(u);
+  }
+
+  void _adminLogin() {
+    final p = masterCtrl.text;
+    final m = widget.auth.master!;
+    final ok = CryptoUtil.hashB64Func(m.saltB64, p) == m.hashB64;
+    if (!ok) return _toast('Master şifre yanlış.');
+    widget.onAdminLogin();
   }
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.all(12),
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Watchlist', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: _name,
-                    decoration: const InputDecoration(
-                      labelText: 'Ad Soyad',
-                      hintText: 'Örn: JOHN DOE',
-                      prefixIcon: Icon(Icons.person_search_rounded),
-                    ),
-                    onSubmitted: (_) => _add(),
-                  ),
-                  const SizedBox(height: 10),
-                  FilledButton.icon(
-                    onPressed: _add,
-                    icon: const Icon(Icons.add_rounded),
-                    label: const Text('Ekle'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 10),
-          const Text('Kayıtlar', style: TextStyle(fontWeight: FontWeight.w800)),
-          const SizedBox(height: 6),
-          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-            stream: FirebaseFirestore.instance.collection('watchlist').orderBy('createdAt', descending: true).limit(200).snapshots(),
-            builder: (context, snap) {
-              final docs = snap.data?.docs ?? const [];
-              if (docs.isEmpty) {
-                return const Card(child: Padding(padding: EdgeInsets.all(16), child: Text('Henüz watchlist kaydı yok.')));
-              }
-              return Column(
-                children: [
-                  for (final d in docs)
-                    Card(
-                      child: ListTile(
-                        leading: const Icon(Icons.visibility_rounded),
-                        title: Text((d.data()['fullName'] ?? '') as String),
-                        subtitle: Text((d.data()['fullNameNorm'] ?? '') as String, style: const TextStyle(color: Colors.black54)),
-                        trailing: IconButton(
-                          tooltip: 'Sil',
-                          icon: const Icon(Icons.delete_outline_rounded),
-                          onPressed: () => d.reference.delete(),
-                        ),
-                      ),
-                    )
-                ],
-              );
-            },
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// -------------------------
-// Equipment Tab
-// -------------------------
-
-class EquipmentTab extends StatefulWidget {
-  const EquipmentTab({super.key, required this.sessionId});
-  final String sessionId;
-
-  @override
-  State<EquipmentTab> createState() => _EquipmentTabState();
-}
-
-class _EquipmentTabState extends State<EquipmentTab> {
-  CollectionReference<Map<String, dynamic>> get _col =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('equipment');
-
-  Future<void> _addOrEdit({EquipmentItem? existing}) async {
-    final res = await showDialog<EquipmentItem>(
-      context: context,
-      builder: (_) => _EquipmentDialog(existing: existing),
-    );
-    if (res == null) return;
-
-    final doc = existing == null ? _col.doc() : _col.doc(existing.id);
-    await doc.set(res.toMap(), SetOptions(merge: true));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  const Expanded(
-                    child: Text('Equipment', style: TextStyle(fontWeight: FontWeight.w900)),
-                  ),
-                  FilledButton.icon(
-                    onPressed: () => _addOrEdit(),
-                    icon: const Icon(Icons.add_rounded),
-                    label: const Text('Ekle'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: _col.orderBy('updatedAt', descending: true).snapshots(),
-              builder: (context, snap) {
-                final docs = snap.data?.docs ?? const [];
-                if (docs.isEmpty) return const Center(child: Text('Equipment yok.'));
-                final items = docs.map(EquipmentItem.fromDoc).toList();
-                return ListView.builder(
-                  itemCount: items.length,
-                  itemBuilder: (context, i) {
-                    final it = items[i];
-                    return Card(
-                      child: ListTile(
-                        title: Text(it.label(), style: const TextStyle(fontWeight: FontWeight.w800)),
-                        subtitle: Text('Seri No: ${it.serials.join(', ')}'),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.edit_rounded),
-                          onPressed: () => _addOrEdit(existing: it),
-                        ),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _EquipmentDialog extends StatefulWidget {
-  const _EquipmentDialog({this.existing});
-  final EquipmentItem? existing;
-
-  @override
-  State<_EquipmentDialog> createState() => _EquipmentDialogState();
-}
-
-class _EquipmentDialogState extends State<_EquipmentDialog> {
-  EquipmentType type = EquipmentType.table;
-  EtdModel etdModel = EtdModel.is600;
-  final _serials = TextEditingController();
-
-  @override
-  void initState() {
-    super.initState();
-    final ex = widget.existing;
-    if (ex != null) {
-      type = ex.type;
-      etdModel = ex.etdModel ?? EtdModel.is600;
-      _serials.text = ex.serials.join(', ');
-    }
-  }
-
-  @override
-  void dispose() {
-    _serials.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text(widget.existing == null ? 'Equipment Ekle' : 'Equipment Duzenle'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            DropdownButtonFormField<EquipmentType>(
-              value: type,
-              items: [
-                DropdownMenuItem(value: EquipmentType.table, child: Text('Masa')),
-                DropdownMenuItem(value: EquipmentType.desk, child: Text('Desk')),
-                DropdownMenuItem(value: EquipmentType.etd, child: Text('ETD')),
-              ],
-              onChanged: (v) => setState(() => type = v ?? EquipmentType.table),
-              decoration: const InputDecoration(labelText: 'Tip'),
-            ),
-            const SizedBox(height: 10),
-            if (type == EquipmentType.etd)
-              DropdownButtonFormField<EtdModel>(
-                value: etdModel,
-                items: [
-                  DropdownMenuItem(value: EtdModel.is600, child: Text('IS600')),
-                  DropdownMenuItem(value: EtdModel.itemiser4dx, child: Text('Itemiser 4DX')),
-                ],
-                onChanged: (v) => setState(() => etdModel = v ?? EtdModel.is600),
-                decoration: const InputDecoration(labelText: 'ETD Model'),
-              ),
-            if (type == EquipmentType.etd) const SizedBox(height: 10),
-            TextField(
-              controller: _serials,
-              maxLines: 2,
-              decoration: const InputDecoration(labelText: 'Seri No(lar)', hintText: 'SN1, SN2, SN3'),
-            ),
-            const SizedBox(height: 6),
-            const Text('Not: Birden fazla seri no virgülle ayır.', style: TextStyle(color: Colors.black54, fontSize: 12)),
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Gate Ops • Giriş'),
+        bottom: TabBar(
+          controller: tab,
+          tabs: const [
+            Tab(text: 'Kullanıcı'),
+            Tab(text: 'Admin Mode'),
           ],
         ),
       ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
-        FilledButton(
-          onPressed: () {
-            final serials = _serials.text
-                .split(',')
-                .map((e) => e.trim())
-                .where((e) => e.isNotEmpty)
-                .toSet()
-                .toList();
-            final id = widget.existing?.id ?? '';
-            Navigator.pop(
-              context,
-              EquipmentItem(id: id, type: type, serials: serials, etdModel: type == EquipmentType.etd ? etdModel : null),
-            );
-          },
-          child: const Text('Kaydet'),
-        ),
-      ],
-    );
-  }
-}
-
-// -------------------------
-// Personnel Tab
-// -------------------------
-
-class PersonnelTab extends StatefulWidget {
-  const PersonnelTab({super.key, required this.sessionId});
-  final String sessionId;
-
-  @override
-  State<PersonnelTab> createState() => _PersonnelTabState();
-}
-
-class _PersonnelTabState extends State<PersonnelTab> {
-  CollectionReference<Map<String, dynamic>> get _col =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('personnel');
-
-  static const titles = [
-    'Erkek Airsider',
-    'Kadın Airsider',
-    'Profiler',
-    'Interviewer',
-    'Team Leader',
-    'Supervisor',
-  ];
-
-  Future<void> _addOrEdit({Personnel? existing}) async {
-    final res = await showDialog<Personnel>(
-      context: context,
-      builder: (_) => _PersonnelDialog(existing: existing),
-    );
-    if (res == null) return;
-    final doc = existing == null ? _col.doc() : _col.doc(existing.id);
-    await doc.set(res.toMap(), SetOptions(merge: true));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
+      body: TabBarView(
+        controller: tab,
         children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  const Expanded(child: Text('Personnel', style: TextStyle(fontWeight: FontWeight.w900))),
-                  FilledButton.icon(
-                    onPressed: () => _addOrEdit(),
-                    icon: const Icon(Icons.add_rounded),
-                    label: const Text('Ekle'),
-                  ),
-                ],
+          ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              TextField(
+                controller: userCtrl,
+                decoration: InputDecoration(labelText: 'Kullanıcı adı (${UsernamePolicy.hint()})'),
               ),
-            ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: passCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Şifre'),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: _userLogin,
+                icon: const Icon(Icons.login),
+                label: const Text('Giriş Yap'),
+              ),
+              const SizedBox(height: 10),
+              Text('Kullanıcı hesabı yoksa, Admin Mode ile admin kullanıcı eklemeli.'),
+            ],
           ),
-          Expanded(
-            child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-              stream: _col.orderBy('updatedAt', descending: true).snapshots(),
-              builder: (context, snap) {
-                final docs = snap.data?.docs ?? const [];
-                if (docs.isEmpty) return const Center(child: Text('Personel yok.'));
-                final items = docs.map(Personnel.fromDoc).toList();
-                return ListView.builder(
-                  itemCount: items.length,
-                  itemBuilder: (context, i) {
-                    final p = items[i];
-                    return Card(
-                      child: ListTile(
-                        title: Text(p.name, style: const TextStyle(fontWeight: FontWeight.w800)),
-                        subtitle: Text(p.title),
-                        trailing: IconButton(icon: const Icon(Icons.edit_rounded), onPressed: () => _addOrEdit(existing: p)),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
+          ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              const Text('Admin Mode sadece master şifre ile açılır.\nBuradan sadece USER eklenir/silinir/şifre resetlenir.'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: masterCtrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Master şifre'),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: _adminLogin,
+                icon: const Icon(Icons.admin_panel_settings),
+                label: const Text('Admin Mode Aç'),
+              ),
+            ],
           ),
         ],
       ),
@@ -2924,307 +506,1443 @@ class _PersonnelTabState extends State<PersonnelTab> {
   }
 }
 
-class _PersonnelDialog extends StatefulWidget {
-  const _PersonnelDialog({this.existing});
-  final Personnel? existing;
+class AdminShell extends StatelessWidget {
+  final AuthData auth;
+  final VoidCallback onAuthChanged;
+  final VoidCallback onLogout;
+
+  const AdminShell({super.key, required this.auth, required this.onAuthChanged, required this.onLogout});
 
   @override
-  State<_PersonnelDialog> createState() => _PersonnelDialogState();
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Admin Mode • Kullanıcı Yönetimi'),
+        actions: [
+          IconButton(onPressed: onLogout, icon: const Icon(Icons.logout), tooltip: 'Çıkış'),
+        ],
+      ),
+      body: AdminUserManagement(auth: auth, onAuthChanged: onAuthChanged),
+    );
+  }
 }
 
-class _PersonnelDialogState extends State<_PersonnelDialog> {
-  final _name = TextEditingController();
-  String title = _PersonnelTabState.titles.first;
+class AdminUserManagement extends StatefulWidget {
+  final AuthData auth;
+  final VoidCallback onAuthChanged;
+  const AdminUserManagement({super.key, required this.auth, required this.onAuthChanged});
+
+  @override
+  State<AdminUserManagement> createState() => _AdminUserManagementState();
+}
+
+class _AdminUserManagementState extends State<AdminUserManagement> {
+  final uCtrl = TextEditingController();
+  final p1Ctrl = TextEditingController();
+  final p2Ctrl = TextEditingController();
+
+  @override
+  void dispose() {
+    uCtrl.dispose();
+    p1Ctrl.dispose();
+    p2Ctrl.dispose();
+    super.dispose();
+  }
+
+  void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  void _save(AuthData data) {
+    AuthStore.save(data);
+    widget.onAuthChanged();
+    setState(() {});
+  }
+
+  void _addUser() {
+    final u = UsernamePolicy.normalize(uCtrl.text);
+    final p1 = p1Ctrl.text;
+    final p2 = p2Ctrl.text;
+
+    if (!UsernamePolicy.validate(u)) return _toast(UsernamePolicy.hint());
+    if (p1 != p2) return _toast('Şifreler aynı değil.');
+    if (!PasswordPolicy.validate(p1)) return _toast(PasswordPolicy.hint());
+
+    final current = AuthStore.load();
+    final exists = current.users.any((e) => e.username == u);
+    if (exists) return _toast('Bu kullanıcı zaten var.');
+
+    final salt = CryptoUtil.genSaltB64();
+    final hash = CryptoUtil.hashB64Func(salt, p1);
+    final updated = current.copyWith(users: [...current.users, UserRecord(username: u, saltB64: salt, hashB64: hash)]);
+
+    _save(updated);
+    uCtrl.clear();
+    p1Ctrl.clear();
+    p2Ctrl.clear();
+    _toast('Kullanıcı eklendi: $u');
+  }
+
+  void _deleteUser(String username) {
+    final current = AuthStore.load();
+    final updated = current.copyWith(users: current.users.where((e) => e.username != username).toList());
+    _save(updated);
+    _toast('Silindi: $username');
+  }
+
+  void _resetPasswordDialog(String username) {
+    final np1 = TextEditingController();
+    final np2 = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('Şifre Reset • $username'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: np1, obscureText: true, decoration: const InputDecoration(labelText: 'Yeni şifre')),
+            const SizedBox(height: 8),
+            TextField(controller: np2, obscureText: true, decoration: const InputDecoration(labelText: 'Yeni şifre (tekrar)')),
+            const SizedBox(height: 8),
+            Text(PasswordPolicy.hint(), style: const TextStyle(fontSize: 12)),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('İptal')),
+          ElevatedButton(
+            onPressed: () {
+              final a = np1.text;
+              final b = np2.text;
+              if (a != b) {
+                _toast('Şifreler aynı değil.');
+                return;
+              }
+              if (!PasswordPolicy.validate(a)) {
+                _toast(PasswordPolicy.hint());
+                return;
+              }
+
+              final current = AuthStore.load();
+              final salt = CryptoUtil.genSaltB64();
+              final hash = CryptoUtil.hashB64Func(salt, a);
+
+              final updatedUsers = current.users.map((e) {
+                if (e.username != username) return e;
+                return UserRecord(username: e.username, saltB64: salt, hashB64: hash);
+              }).toList();
+
+              _save(current.copyWith(users: updatedUsers));
+              Navigator.pop(context);
+              _toast('Şifre güncellendi.');
+            },
+            child: const Text('Kaydet'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final current = AuthStore.load();
+    final users = [...current.users]..sort((a, b) => a.username.compareTo(b.username));
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('USER Ekle', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 12),
+              TextField(
+                controller: uCtrl,
+                decoration: InputDecoration(labelText: 'Kullanıcı adı (${UsernamePolicy.hint()})'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: p1Ctrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Şifre'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: p2Ctrl,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'Şifre (tekrar)'),
+              ),
+              const SizedBox(height: 8),
+              Text(PasswordPolicy.hint(), style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(onPressed: _addUser, icon: const Icon(Icons.person_add), label: const Text('Kullanıcı Ekle')),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const Text('Kullanıcılar', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        if (users.isEmpty) const Text('Henüz kullanıcı yok.'),
+        ...users.map((u) => Card(
+              child: ListTile(
+                title: Text(u.username),
+                subtitle: const Text('Role: USER'),
+                trailing: Wrap(
+                  spacing: 6,
+                  children: [
+                    TextButton(
+                      onPressed: () => _resetPasswordDialog(u.username),
+                      child: const Text('Şifre Reset'),
+                    ),
+                    IconButton(
+                      tooltip: 'Sil',
+                      onPressed: () => _deleteUser(u.username),
+                      icon: const Icon(Icons.delete),
+                    ),
+                  ],
+                ),
+              ),
+            )),
+        const SizedBox(height: 16),
+        OutlinedButton.icon(
+          onPressed: () {
+            // Danger button: reset all (optional). We'll keep it hidden but functional in MVP.
+            showDialog(
+              context: context,
+              builder: (_) => AlertDialog(
+                title: const Text('Tüm sistemi sıfırla?'),
+                content: const Text('Master şifre + tüm kullanıcılar silinir. Bu işlem geri alınamaz.'),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('İptal')),
+                  ElevatedButton(
+                    onPressed: () {
+                      AuthStore.clearAll();
+                      widget.onAuthChanged();
+                      Navigator.pop(context);
+                      _toast('Sistem sıfırlandı. Sayfayı yenileyin.');
+                    },
+                    child: const Text('Sıfırla'),
+                  ),
+                ],
+              ),
+            );
+          },
+          icon: const Icon(Icons.delete_forever),
+          label: const Text('Tüm Sistemi Sıfırla (Dikkat)'),
+        ),
+      ],
+    );
+  }
+}
+
+/* =========================================================
+   GATE OPS SHELL (existing app)
+========================================================= */
+
+class GateOpsShell extends StatefulWidget {
+  final String username;
+  final VoidCallback onLogout;
+
+  const GateOpsShell({super.key, required this.username, required this.onLogout});
+
+  @override
+  State<GateOpsShell> createState() => _GateOpsShellState();
+}
+
+class _GateOpsShellState extends State<GateOpsShell> {
+  final session = FlightSession();
+
+  @override
+  Widget build(BuildContext context) {
+    return session.isCreated
+        ? FlightDetailScreen(
+            session: session,
+            username: widget.username,
+            onReset: () => setState(() => session.clearAll()),
+            onLogout: widget.onLogout,
+          )
+        : FlightCreateScreen(
+            username: widget.username,
+            session: session,
+            onLogout: widget.onLogout,
+            onCreated: (_) => setState(() {}),
+          );
+  }
+}
+
+/* =========================================================
+   MODELS / OPS STATE (Gate)
+========================================================= */
+
+enum StaffRole { supervisor, asMale, asFemale, other }
+
+extension StaffRoleLabel on StaffRole {
+  String get label {
+    switch (this) {
+      case StaffRole.supervisor:
+        return 'Supervisor';
+      case StaffRole.asMale:
+        return 'AS Erkek';
+      case StaffRole.asFemale:
+        return 'AS Kadın';
+      case StaffRole.other:
+        return 'Diğer';
+    }
+  }
+}
+
+class StaffAssignment {
+  final String name;
+  final StaffRole role;
+  final String start; // HH:MM
+  final String end; // HH:MM
+
+  StaffAssignment({required this.name, required this.role, required this.start, required this.end});
+
+  int totalMinutes() {
+    final s = _parseHHMM(start);
+    final e = _parseHHMM(end);
+    if (s == null || e == null) return 0;
+    final diff = e - s;
+    return diff < 0 ? 0 : diff;
+  }
+}
+
+enum EtdModel { is600, fourDX }
+
+extension EtdModelLabel on EtdModel {
+  String get label => this == EtdModel.is600 ? 'IS600' : '4DX';
+}
+
+class EtdDevice {
+  final EtdModel model;
+  final String serialNo;
+  EtdDevice({required this.model, required this.serialNo});
+}
+
+class Passenger {
+  final String nameNorm;
+  final String nameDisplay;
+  final String seat;
+  final DateTime scannedAt;
+
+  Passenger({required this.nameNorm, required this.nameDisplay, required this.seat, required this.scannedAt});
+}
+
+class PassengerEvent {
+  final Passenger passenger;
+  final bool watchlistHit;
+  bool dftSelected;
+  bool dftSearched;
+
+  PassengerEvent({required this.passenger, required this.watchlistHit, required this.dftSelected, required this.dftSearched});
+}
+
+class NameParts {
+  final String surname;
+  final String firstNameToken;
+
+  NameParts({required this.surname, required this.firstNameToken});
+
+  static NameParts fromNormalized(String nameNorm) {
+    final tokens = nameNorm.split(' ').where((t) => t.isNotEmpty).toList();
+    if (tokens.isEmpty) return NameParts(surname: '', firstNameToken: '');
+    if (tokens.length == 1) return NameParts(surname: tokens[0], firstNameToken: '');
+    return NameParts(surname: tokens[0], firstNameToken: tokens[1]);
+  }
+
+  static String? reverseTokens(String nameNorm) {
+    final tokens = nameNorm.split(' ').where((t) => t.isNotEmpty).toList();
+    if (tokens.length < 2) return null;
+    return (tokens.sublist(1)..add(tokens[0])).join(' ');
+  }
+}
+
+class FlightSession {
+  // Flight basics
+  String flightCode = '';
+  int bookedPax = 0;
+  String gateNo = '';
+  String gateAssignStart = ''; // HH:MM
+
+  // Ops times
+  String? gateSetupTime;
+  String? firstPaxTime;
+  String? lastPaxTime;
+  String? dutyStart;
+  String? dutyEnd;
+
+  // Lists
+  final Set<String> watchlist = {}; // normalized names
+  final Map<String, NameParts> watchlistParts = {}; // normalized name -> parts
+
+  final List<StaffAssignment> staff = [];
+  final Set<String> tableSerials = {};
+  final Set<String> deskSerials = {};
+  final List<EtdDevice> etdDevices = [];
+
+  // Scans keyed by unique key
+  final Map<String, PassengerEvent> scans = {};
+
+  bool get isCreated => flightCode.isNotEmpty;
+
+  void clearAll() {
+    flightCode = '';
+    bookedPax = 0;
+    gateNo = '';
+    gateAssignStart = '';
+
+    gateSetupTime = null;
+    firstPaxTime = null;
+    lastPaxTime = null;
+    dutyStart = null;
+    dutyEnd = null;
+
+    watchlist.clear();
+    watchlistParts.clear();
+    staff.clear();
+    tableSerials.clear();
+    deskSerials.clear();
+    etdDevices.clear();
+    scans.clear();
+  }
+
+  void create({required String flightCodeInput, required int booked, required String gate, required String start}) {
+    flightCode = normalizeFlight(flightCodeInput);
+    bookedPax = booked;
+    gateNo = gate.trim().toUpperCase();
+    gateAssignStart = start.trim();
+  }
+
+  void rebuildWatchlistParts() {
+    watchlistParts.clear();
+    for (final n in watchlist) {
+      watchlistParts[n] = NameParts.fromNormalized(n);
+    }
+  }
+
+  bool isWatchlistHit(String scannedNameNorm) {
+    if (watchlist.isEmpty) return false;
+    if (watchlist.contains(scannedNameNorm)) return true;
+
+    final scanned = NameParts.fromNormalized(scannedNameNorm);
+    if (scanned.surname.isEmpty || scanned.firstNameToken.isEmpty) {
+      final reversed = NameParts.reverseTokens(scannedNameNorm);
+      if (reversed != null && watchlist.contains(reversed)) return true;
+      return false;
+    }
+
+    for (final wp in watchlistParts.values) {
+      if (wp.surname == scanned.surname && wp.firstNameToken == scanned.firstNameToken) return true;
+    }
+
+    final reversed = NameParts.reverseTokens(scannedNameNorm);
+    if (reversed != null && watchlist.contains(reversed)) return true;
+
+    return false;
+  }
+
+  void addStaff(StaffAssignment s) => staff.add(s);
+
+  void removeStaffAt(int index) {
+    if (index >= 0 && index < staff.length) staff.removeAt(index);
+  }
+
+  bool addTableSerial(String serial) {
+    final s = serial.trim().toUpperCase();
+    if (s.isEmpty) return false;
+    final before = tableSerials.length;
+    tableSerials.add(s);
+    return tableSerials.length > before;
+  }
+
+  bool addDeskSerial(String serial) {
+    final s = serial.trim().toUpperCase();
+    if (s.isEmpty) return false;
+    final before = deskSerials.length;
+    deskSerials.add(s);
+    return deskSerials.length > before;
+  }
+
+  void removeTableSerial(String serial) => tableSerials.remove(serial);
+  void removeDeskSerial(String serial) => deskSerials.remove(serial);
+
+  void addEtd(EtdDevice etd) {
+    final sn = etd.serialNo.trim().toUpperCase();
+    if (sn.isEmpty) throw ArgumentError('ETD seri no zorunlu');
+    final exists = etdDevices.any((e) => e.serialNo.toUpperCase() == sn);
+    if (exists) throw ArgumentError('ETD seri no duplicate: $sn');
+    etdDevices.add(EtdDevice(model: etd.model, serialNo: sn));
+  }
+
+  void removeEtdAt(int index) {
+    if (index >= 0 && index < etdDevices.length) etdDevices.removeAt(index);
+  }
+
+  ScanResult onMockScan(String mock) {
+    // mock format: FLIGHT|NAME|SEAT
+    final parts = mock.split('|');
+    if (parts.length < 3) return ScanResult(ScanResultType.error, 'Format: FLIGHT|NAME|SEAT');
+
+    final scannedFlight = normalizeFlight(parts[0]);
+    final nameNorm = normalizeName(parts[1]);
+    final seat = parts[2].trim().toUpperCase();
+
+    if (scannedFlight != flightCode) {
+      return ScanResult(ScanResultType.wrongFlight, 'Yanlış uçuş: $scannedFlight (beklenen $flightCode)');
+    }
+
+    if (firstPaxTime == null) firstPaxTime = _nowHHMM();
+
+    final key = '$flightCode|$nameNorm|$seat';
+    if (scans.containsKey(key)) {
+      return ScanResult(ScanResultType.duplicate, 'Zaten okutuldu', passenger: scans[key]!.passenger);
+    }
+
+    final p = Passenger(nameNorm: nameNorm, nameDisplay: nameNorm, seat: seat, scannedAt: DateTime.now());
+
+    final hit = isWatchlistHit(nameNorm);
+    scans[key] = PassengerEvent(passenger: p, watchlistHit: hit, dftSelected: false, dftSearched: false);
+
+    lastPaxTime = _nowHHMM();
+
+    if (hit) return ScanResult(ScanResultType.watchlistHit, 'Watchlist yolcu tespit edildi', passenger: p);
+    return ScanResult(ScanResultType.ok, 'OK', passenger: p);
+  }
+
+  void toggleDftSelected(String scanKey) {
+    final e = scans[scanKey];
+    if (e == null) return;
+    e.dftSelected = !e.dftSelected;
+  }
+
+  void toggleDftSearched(String scanKey) {
+    final e = scans[scanKey];
+    if (e == null) return;
+    e.dftSearched = !e.dftSearched;
+  }
+
+  Stats getStats() {
+    final arrived = scans.length;
+    final notArrived = max(0, bookedPax - arrived);
+
+    int wlArrived = 0;
+    final arrivedNames = <String>{};
+    for (final e in scans.values) {
+      arrivedNames.add(e.passenger.nameNorm);
+      if (e.watchlistHit) wlArrived++;
+    }
+    final wlTotal = watchlist.length;
+    final wlNotArrived = max(0, wlTotal - wlArrived);
+    final wlMissing = watchlist.where((n) => !arrivedNames.contains(n)).toList()..sort();
+
+    int dftSel = 0, dftSea = 0;
+    for (final e in scans.values) {
+      if (e.dftSelected) dftSel++;
+      if (e.dftSearched) dftSea++;
+    }
+    final dftRate = arrived == 0 ? 0.0 : (dftSea / arrived) * 100.0;
+
+    return Stats(
+      arrived: arrived,
+      notArrived: notArrived,
+      watchlistTotal: wlTotal,
+      watchlistArrived: wlArrived,
+      watchlistNotArrived: wlNotArrived,
+      watchlistMissing: wlMissing,
+      dftSelected: dftSel,
+      dftSearched: dftSea,
+      dftRatePercent: dftRate,
+    );
+  }
+
+  Map<String, dynamic> buildSummaryRow({required String byUser}) {
+    final s = getStats();
+    return {
+      'FlightCode': flightCode,
+      'GateNo': gateNo,
+      'GateAssignStart': gateAssignStart,
+      'BookedPax': bookedPax,
+      'ArrivedCount': s.arrived,
+      'NotArrivedCount': s.notArrived,
+      'WatchlistTotal': s.watchlistTotal,
+      'WatchlistArrived': s.watchlistArrived,
+      'WatchlistNotArrived': s.watchlistNotArrived,
+      'DFT_Selected_Count': s.dftSelected,
+      'DFT_Searched_Count': s.dftSearched,
+      'DFT_Search_Rate_%': double.parse(s.dftRatePercent.toStringAsFixed(1)),
+      'GateSetupTime': gateSetupTime,
+      'FirstPaxTime': firstPaxTime,
+      'LastPaxTime': lastPaxTime,
+      'DutyStart': dutyStart,
+      'DutyEnd': dutyEnd,
+      'RecordedBy': byUser,
+    };
+  }
+
+  List<Map<String, dynamic>> buildStaffRows() {
+    return staff
+        .map((s) => {
+              'FlightCode': flightCode,
+              'PersonName': s.name,
+              'Role': s.role.label,
+              'Start': s.start,
+              'End': s.end,
+              'TotalMinutes': s.totalMinutes(),
+            })
+        .toList();
+  }
+
+  List<Map<String, dynamic>> buildEquipmentRows() {
+    final rows = <Map<String, dynamic>>[];
+    for (final t in tableSerials) {
+      rows.add({'FlightCode': flightCode, 'Type': 'TABLE', 'Model': null, 'SerialNumber': t});
+    }
+    for (final d in deskSerials) {
+      rows.add({'FlightCode': flightCode, 'Type': 'DESK', 'Model': null, 'SerialNumber': d});
+    }
+    for (final e in etdDevices) {
+      rows.add({'FlightCode': flightCode, 'Type': 'ETD', 'Model': e.model.label, 'SerialNumber': e.serialNo.toUpperCase()});
+    }
+    return rows;
+  }
+
+  List<Map<String, dynamic>> buildDftRows() {
+    final rows = <Map<String, dynamic>>[];
+    for (final entry in scans.entries) {
+      final e = entry.value;
+      if (e.dftSelected || e.dftSearched) {
+        rows.add({
+          'FlightCode': flightCode,
+          'PassengerName': e.passenger.nameDisplay,
+          'Seat': e.passenger.seat,
+          'DFT_Selected': e.dftSelected ? 'Y' : 'N',
+          'DFT_Searched': e.dftSearched ? 'Y' : 'N',
+          'ScanTime': _hhmm(e.passenger.scannedAt),
+        });
+      }
+    }
+    return rows;
+  }
+}
+
+class Stats {
+  final int arrived;
+  final int notArrived;
+  final int watchlistTotal;
+  final int watchlistArrived;
+  final int watchlistNotArrived;
+  final List<String> watchlistMissing;
+  final int dftSelected;
+  final int dftSearched;
+  final double dftRatePercent;
+
+  Stats({
+    required this.arrived,
+    required this.notArrived,
+    required this.watchlistTotal,
+    required this.watchlistArrived,
+    required this.watchlistNotArrived,
+    required this.watchlistMissing,
+    required this.dftSelected,
+    required this.dftSearched,
+    required this.dftRatePercent,
+  });
+}
+
+enum ScanResultType { ok, wrongFlight, duplicate, watchlistHit, error }
+
+class ScanResult {
+  final ScanResultType type;
+  final String message;
+  final Passenger? passenger;
+
+  ScanResult(this.type, this.message, {this.passenger});
+}
+
+/* =========================================================
+   UI (Gate Ops) — Create / Detail / Tabs
+========================================================= */
+
+class FlightCreateScreen extends StatefulWidget {
+  final String username;
+  final FlightSession session;
+  final VoidCallback onLogout;
+  final void Function(FlightSession) onCreated;
+
+  const FlightCreateScreen({
+    super.key,
+    required this.username,
+    required this.session,
+    required this.onLogout,
+    required this.onCreated,
+  });
+
+  @override
+  State<FlightCreateScreen> createState() => _FlightCreateScreenState();
+}
+
+class _FlightCreateScreenState extends State<FlightCreateScreen> {
+  final flightCtrl = TextEditingController();
+  final bookedCtrl = TextEditingController();
+  final gateCtrl = TextEditingController();
+  final startCtrl = TextEditingController();
+
+  bool _validHHMM(String s) {
+    final r = RegExp(r'^\d{2}:\d{2}$');
+    if (!r.hasMatch(s)) return false;
+    final hh = int.tryParse(s.substring(0, 2));
+    final mm = int.tryParse(s.substring(3, 5));
+    if (hh == null || mm == null) return false;
+    return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59;
+  }
+
+  void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  @override
+  void dispose() {
+    flightCtrl.dispose();
+    bookedCtrl.dispose();
+    gateCtrl.dispose();
+    startCtrl.dispose();
+    super.dispose();
+  }
+
+  void _create() {
+    final flight = flightCtrl.text.trim();
+    final booked = int.tryParse(bookedCtrl.text.trim()) ?? -1;
+    final gate = gateCtrl.text.trim();
+    final s = startCtrl.text.trim();
+
+    if (flight.isEmpty || gate.isEmpty || booked < 0) return _toast('Flight / Booked / Gate zorunlu');
+    if (!_validHHMM(s)) return _toast('Gate tahsis başlangıç saati HH:MM olmalı');
+
+    widget.session.create(flightCodeInput: flight, booked: booked, gate: gate, start: s);
+    widget.onCreated(widget.session);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Uçuş Oluştur • ${widget.username}'),
+        actions: [
+          IconButton(onPressed: widget.onLogout, icon: const Icon(Icons.logout), tooltip: 'Çıkış'),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextField(controller: flightCtrl, decoration: const InputDecoration(labelText: 'Flight Code (örn: BA679)')),
+          const SizedBox(height: 12),
+          TextField(
+            controller: bookedCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Rezervasyonlu yolcu (Booked Pax)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(controller: gateCtrl, decoration: const InputDecoration(labelText: 'Gate No (örn: A12)')),
+          const SizedBox(height: 12),
+          TextField(controller: startCtrl, decoration: const InputDecoration(labelText: 'Gate tahsis başlangıç (HH:MM)')),
+          const SizedBox(height: 20),
+          ElevatedButton.icon(onPressed: _create, icon: const Icon(Icons.playlist_add), label: const Text('Uçuşu Başlat')),
+          const SizedBox(height: 12),
+          const Text('Not: Bu MVP RAM’de çalışır. Sayfayı yenilersen uçuş verileri silinir.'),
+        ],
+      ),
+    );
+  }
+}
+
+class FlightDetailScreen extends StatefulWidget {
+  final FlightSession session;
+  final String username;
+  final VoidCallback onReset;
+  final VoidCallback onLogout;
+
+  const FlightDetailScreen({
+    super.key,
+    required this.session,
+    required this.username,
+    required this.onReset,
+    required this.onLogout,
+  });
+
+  @override
+  State<FlightDetailScreen> createState() => _FlightDetailScreenState();
+}
+
+class _FlightDetailScreenState extends State<FlightDetailScreen> with SingleTickerProviderStateMixin {
+  late final TabController tab;
 
   @override
   void initState() {
     super.initState();
-    final ex = widget.existing;
-    if (ex != null) {
-      _name.text = ex.name;
-      title = ex.title.isEmpty ? title : ex.title;
-    }
+    tab = TabController(length: 5, vsync: this);
   }
 
   @override
   void dispose() {
-    _name.dispose();
+    tab.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text(widget.existing == null ? 'Personel Ekle' : 'Personel Duzenle'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
+    final s = widget.session.getStats();
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('${widget.session.flightCode} • Gate ${widget.session.gateNo}'),
+        actions: [
+          IconButton(onPressed: widget.onLogout, icon: const Icon(Icons.logout), tooltip: 'Çıkış'),
+          IconButton(tooltip: 'Uçuşu sıfırla', onPressed: widget.onReset, icon: const Icon(Icons.refresh)),
+        ],
+        bottom: TabBar(
+          controller: tab,
+          isScrollable: true,
+          tabs: const [
+            Tab(text: 'Dashboard'),
+            Tab(text: 'Watchlist'),
+            Tab(text: 'Scan'),
+            Tab(text: 'Personel'),
+            Tab(text: 'Ekipman'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: tab,
         children: [
-          TextField(
-            controller: _name,
-            decoration: const InputDecoration(labelText: 'Isim Soyisim', prefixIcon: Icon(Icons.person_rounded)),
-          ),
-          const SizedBox(height: 10),
-          DropdownButtonFormField<String>(
-            value: title,
-            items: _PersonnelTabState.titles.map((t) => DropdownMenuItem(value: t, child: Text(t))).toList(),
-            onChanged: (v) => setState(() => title = v ?? _PersonnelTabState.titles.first),
-            decoration: const InputDecoration(labelText: 'Title', prefixIcon: Icon(Icons.badge_rounded)),
-          ),
+          _DashboardTab(session: widget.session, username: widget.username),
+          _WatchlistTab(session: widget.session, onChanged: () => setState(() {})),
+          _ScanTab(session: widget.session, onChanged: () => setState(() {})),
+          _StaffTab(session: widget.session, onChanged: () => setState(() {})),
+          _EquipmentTab(session: widget.session, onChanged: () => setState(() {})),
         ],
       ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Iptal')),
-        FilledButton(
-          onPressed: () {
-            final name = _name.text.trim();
-            if (name.isEmpty) return;
-            Navigator.pop(context, Personnel(id: widget.existing?.id ?? '', name: name, title: title));
-          },
-          child: const Text('Kaydet'),
+      bottomNavigationBar: _BottomSummaryBar(stats: s),
+    );
+  }
+}
+
+class _BottomSummaryBar extends StatelessWidget {
+  final Stats stats;
+  const _BottomSummaryBar({required this.stats});
+
+  @override
+  Widget build(BuildContext context) {
+    final dft = '${stats.dftSearched}/${stats.arrived} (${stats.dftRatePercent.toStringAsFixed(1)}%)';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
+      ),
+      child: Wrap(
+        spacing: 14,
+        runSpacing: 8,
+        children: [
+          Chip(label: Text('Gelen: ${stats.arrived}')),
+          Chip(label: Text('Kalan: ${stats.notArrived}')),
+          Chip(label: Text('Watchlist: ${stats.watchlistArrived}/${stats.watchlistTotal}')),
+          Chip(label: Text('DFT: $dft')),
+        ],
+      ),
+    );
+  }
+}
+
+class _DashboardTab extends StatefulWidget {
+  final FlightSession session;
+  final String username;
+  const _DashboardTab({required this.session, required this.username});
+
+  @override
+  State<_DashboardTab> createState() => _DashboardTabState();
+}
+
+class _DashboardTabState extends State<_DashboardTab> {
+  final gateSetupCtrl = TextEditingController();
+  final dutyStartCtrl = TextEditingController();
+  final dutyEndCtrl = TextEditingController();
+
+  @override
+  void dispose() {
+    gateSetupCtrl.dispose();
+    dutyStartCtrl.dispose();
+    dutyEndCtrl.dispose();
+    super.dispose();
+  }
+
+  void _saveTimes() {
+    widget.session.gateSetupTime = gateSetupCtrl.text.trim().isEmpty ? null : gateSetupCtrl.text.trim();
+    widget.session.dutyStart = dutyStartCtrl.text.trim().isEmpty ? null : dutyStartCtrl.text.trim();
+    widget.session.dutyEnd = dutyEndCtrl.text.trim().isEmpty ? null : dutyEndCtrl.text.trim();
+    setState(() {});
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Kaydedildi')));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = widget.session;
+    final stats = session.getStats();
+
+    gateSetupCtrl.text = session.gateSetupTime ?? '';
+    dutyStartCtrl.text = session.dutyStart ?? '';
+    dutyEndCtrl.text = session.dutyEnd ?? '';
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Recorded By: ${widget.username}'),
+              const SizedBox(height: 8),
+              Text('Booked Pax: ${session.bookedPax}', style: const TextStyle(fontSize: 16)),
+              const SizedBox(height: 8),
+              Text('Gelen: ${stats.arrived}  |  Kalan: ${stats.notArrived}', style: const TextStyle(fontSize: 16)),
+              const SizedBox(height: 8),
+              Text('Gate Tahsis Başlangıç: ${session.gateAssignStart}'),
+              const SizedBox(height: 8),
+              Text('İlk yolcu müracaat: ${session.firstPaxTime ?? "-"}'),
+              Text('Son yolcu müracaat: ${session.lastPaxTime ?? "-"}'),
+              const SizedBox(height: 8),
+              Text('Watchlist: ${stats.watchlistArrived}/${stats.watchlistTotal}'),
+              Text('DFT: ${stats.dftSearched}/${stats.arrived} (${stats.dftRatePercent.toStringAsFixed(1)}%)'),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Operasyon Saatleri', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 12),
+              TextField(controller: gateSetupCtrl, decoration: const InputDecoration(labelText: 'Gate kurulum saati (HH:MM)')),
+              const SizedBox(height: 12),
+              TextField(controller: dutyStartCtrl, decoration: const InputDecoration(labelText: 'Görev başlangıç (HH:MM)')),
+              const SizedBox(height: 12),
+              TextField(controller: dutyEndCtrl, decoration: const InputDecoration(labelText: 'Görev bitiş (HH:MM)')),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(onPressed: _saveTimes, icon: const Icon(Icons.save), label: const Text('Kaydet')),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Rapor Önizleme (Excel satırları)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 12),
+              Text('Flight_Summary Row:\n${session.buildSummaryRow(byUser: widget.username)}'),
+              const SizedBox(height: 10),
+              Text('Staff Rows: ${session.buildStaffRows().length}'),
+              Text('Equipment Rows: ${session.buildEquipmentRows().length}'),
+              Text('DFT Rows: ${session.buildDftRows().length}'),
+            ]),
+          ),
         ),
       ],
     );
   }
 }
 
-// -------------------------
-// Times Tab
-// -------------------------
-
-class TimesTab extends StatefulWidget {
-  const TimesTab({super.key, required this.sessionId});
-  final String sessionId;
+class _WatchlistTab extends StatefulWidget {
+  final FlightSession session;
+  final VoidCallback onChanged;
+  const _WatchlistTab({required this.session, required this.onChanged});
 
   @override
-  State<TimesTab> createState() => _TimesTabState();
+  State<_WatchlistTab> createState() => _WatchlistTabState();
 }
 
-class _TimesTabState extends State<TimesTab> {
-  DocumentReference<Map<String, dynamic>> get _doc =>
-      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
+class _WatchlistTabState extends State<_WatchlistTab> {
+  final nameCtrl = TextEditingController();
 
-  Future<void> _setTime(String key) async {
-    final now = DateTime.now();
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Saat Kaydet'),
-        content: Text('$key = ${now.toString().substring(0, 19)}'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Vazgec')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Kaydet')),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    await _doc.set({key: Timestamp.fromDate(now)}, SetOptions(merge: true));
+  @override
+  void dispose() {
+    nameCtrl.dispose();
+    super.dispose();
   }
 
-  Widget _tile(String label, String field, Map<String, dynamic> data) {
-    final ts = data[field] as Timestamp?;
-    final val = ts?.toDate().toString().substring(11, 19) ?? '--:--:--';
-    return Card(
-      child: ListTile(
-        title: Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
-        subtitle: Text(val),
-        trailing: FilledButton.tonal(
-          onPressed: () => _setTime(field),
-          child: const Text('Set Now'),
-        ),
-      ),
-    );
+  void _add() {
+    final raw = nameCtrl.text.trim();
+    if (raw.isEmpty) return;
+    if (widget.session.watchlist.length >= 10) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Watchlist max 10 kişi')));
+      return;
+    }
+    widget.session.watchlist.add(normalizeName(raw));
+    widget.session.rebuildWatchlistParts();
+    nameCtrl.clear();
+    widget.onChanged();
+    setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-        stream: _doc.snapshots(),
-        builder: (context, snap) {
-          final data = snap.data?.data() ?? <String, dynamic>{};
-          return ListView(
-            children: [
-              const SizedBox(height: 6),
-              _tile('Gate Tahsis', 'gateAssignAt', data),
-              _tile('Operation Start', 'operationStartAt', data),
-              _tile('First Pax', 'firstPaxAt', data),
-              _tile('Last Pax', 'lastPaxAt', data),
-              _tile('Boarding Finished', 'boardingFinishedAt', data),
-              _tile('Operation Finished', 'operationFinishedAt', data),
-              const SizedBox(height: 10),
-            ],
-          );
-        },
-      ),
+    final wl = widget.session.watchlist.toList()..sort();
+    final stats = widget.session.getStats();
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Watchlist: ${stats.watchlistArrived}/${stats.watchlistTotal}', style: const TextStyle(fontSize: 16)),
+              const SizedBox(height: 8),
+              if (stats.watchlistMissing.isNotEmpty) Text('Gelmeyen: ${stats.watchlistMissing.join(", ")}'),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(child: TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'İsim ekle (örn: LILLEY DAVID)'))),
+            const SizedBox(width: 8),
+            ElevatedButton(onPressed: _add, child: const Text('Ekle')),
+          ],
+        ),
+        const SizedBox(height: 12),
+        if (wl.isEmpty) const Text('Watchlist boş.'),
+        ...wl.map((n) => ListTile(
+              title: Text(n),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete),
+                onPressed: () {
+                  widget.session.watchlist.remove(n);
+                  widget.session.rebuildWatchlistParts();
+                  widget.onChanged();
+                  setState(() {});
+                },
+              ),
+            )),
+      ],
     );
   }
 }
 
-// -------------------------
-// Export Tab
-// -------------------------
-
-class ExportTab extends StatefulWidget {
-  const ExportTab({super.key, required this.sessionId, required this.flightCode, required this.gate});
-  final String sessionId;
-  final String flightCode;
-  final String gate;
+class _ScanTab extends StatefulWidget {
+  final FlightSession session;
+  final VoidCallback onChanged;
+  const _ScanTab({required this.session, required this.onChanged});
 
   @override
-  State<ExportTab> createState() => _ExportTabState();
+  State<_ScanTab> createState() => _ScanTabState();
 }
 
-class _ExportTabState extends State<ExportTab> {
-  bool _busy = false;
+class _ScanTabState extends State<_ScanTab> {
+  final mockCtrl = TextEditingController(text: 'BA679|AKBULUT/FATIH MR|2D');
+  ScanResult? last;
 
-  Future<void> _exportXlsx() async {
-    setState(() => _busy = true);
+  @override
+  void dispose() {
+    mockCtrl.dispose();
+    super.dispose();
+  }
+
+  Color _resultColor(ScanResultType t, BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    switch (t) {
+      case ScanResultType.ok:
+        return cs.primaryContainer;
+      case ScanResultType.watchlistHit:
+        return cs.tertiaryContainer;
+      case ScanResultType.wrongFlight:
+      case ScanResultType.duplicate:
+      case ScanResultType.error:
+        return cs.errorContainer;
+    }
+  }
+
+  void _scan() {
+    final r = widget.session.onMockScan(mockCtrl.text.trim());
+    setState(() => last = r);
+    widget.onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = widget.session;
+    final entries = session.scans.entries.toList().reversed.toList();
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Mock Scan', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              const Text('Format: FLIGHT|NAME|SEAT (örn: BA679|LILLEY/DAVID MR|12A)'),
+              const SizedBox(height: 12),
+              TextField(controller: mockCtrl),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(onPressed: _scan, icon: const Icon(Icons.qr_code_scanner), label: const Text('Scan')),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (last != null)
+          Card(
+            color: _resultColor(last!.type, context),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Sonuç: ${last!.type.name.toUpperCase()}'),
+                Text(last!.message),
+                if (last!.passenger != null) Text('Yolcu: ${last!.passenger!.nameDisplay} • Seat: ${last!.passenger!.seat}'),
+              ]),
+            ),
+          ),
+        const SizedBox(height: 12),
+        const Text('Tarananlar', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        if (entries.isEmpty) const Text('Henüz tarama yok.'),
+        ...entries.map((e) {
+          final key = e.key;
+          final ev = e.value;
+          return Card(
+            child: ListTile(
+              title: Text('${ev.passenger.nameDisplay} • ${ev.passenger.seat}'),
+              subtitle: Text('Scan: ${_hhmm(ev.passenger.scannedAt)}${ev.watchlistHit ? " • Watchlist" : ""}'),
+              trailing: Wrap(
+                spacing: 6,
+                children: [
+                  FilterChip(
+                    label: const Text('DFT Seç'),
+                    selected: ev.dftSelected,
+                    onSelected: (_) {
+                      setState(() => session.toggleDftSelected(key));
+                      widget.onChanged();
+                    },
+                  ),
+                  FilterChip(
+                    label: const Text('DFT Arandı'),
+                    selected: ev.dftSearched,
+                    onSelected: (_) {
+                      setState(() => session.toggleDftSearched(key));
+                      widget.onChanged();
+                    },
+                  ),
+                ],
+              ),
+            ),
+          );
+        }),
+      ],
+    );
+  }
+}
+
+class _StaffTab extends StatefulWidget {
+  final FlightSession session;
+  final VoidCallback onChanged;
+  const _StaffTab({required this.session, required this.onChanged});
+
+  @override
+  State<_StaffTab> createState() => _StaffTabState();
+}
+
+class _StaffTabState extends State<_StaffTab> {
+  final nameCtrl = TextEditingController();
+  final startCtrl = TextEditingController(text: '05:45');
+  final endCtrl = TextEditingController(text: '09:00');
+  StaffRole role = StaffRole.other;
+
+  @override
+  void dispose() {
+    nameCtrl.dispose();
+    startCtrl.dispose();
+    endCtrl.dispose();
+    super.dispose();
+  }
+
+  void _add() {
+    final name = nameCtrl.text.trim();
+    if (name.isEmpty) return;
+    widget.session.addStaff(StaffAssignment(name: name, role: role, start: startCtrl.text.trim(), end: endCtrl.text.trim()));
+    nameCtrl.clear();
+    widget.onChanged();
+    setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final list = widget.session.staff;
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Personel Ekle', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 12),
+              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Ad Soyad')),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<StaffRole>(
+                value: role,
+                decoration: const InputDecoration(labelText: 'Rol'),
+                items: StaffRole.values.map((r) => DropdownMenuItem(value: r, child: Text(r.label))).toList(),
+                onChanged: (v) => setState(() => role = v ?? StaffRole.other),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(child: TextField(controller: startCtrl, decoration: const InputDecoration(labelText: 'Başlangıç (HH:MM)'))),
+                  const SizedBox(width: 10),
+                  Expanded(child: TextField(controller: endCtrl, decoration: const InputDecoration(labelText: 'Bitiş (HH:MM)'))),
+                ],
+              ),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(onPressed: _add, icon: const Icon(Icons.person_add), label: const Text('Ekle')),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const Text('Personel Listesi', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 8),
+        if (list.isEmpty) const Text('Personel yok.'),
+        ...List.generate(list.length, (i) {
+          final s = list[i];
+          return ListTile(
+            title: Text('${s.name} • ${s.role.label}'),
+            subtitle: Text('${s.start}–${s.end} • ${s.totalMinutes()} dk'),
+            trailing: IconButton(
+              icon: const Icon(Icons.delete),
+              onPressed: () {
+                widget.session.removeStaffAt(i);
+                widget.onChanged();
+                setState(() {});
+              },
+            ),
+          );
+        }),
+      ],
+    );
+  }
+}
+
+class _EquipmentTab extends StatefulWidget {
+  final FlightSession session;
+  final VoidCallback onChanged;
+  const _EquipmentTab({required this.session, required this.onChanged});
+
+  @override
+  State<_EquipmentTab> createState() => _EquipmentTabState();
+}
+
+class _EquipmentTabState extends State<_EquipmentTab> {
+  final tableCtrl = TextEditingController();
+  final deskCtrl = TextEditingController();
+  final etdSerialCtrl = TextEditingController();
+  EtdModel etdModel = EtdModel.is600;
+
+  @override
+  void dispose() {
+    tableCtrl.dispose();
+    deskCtrl.dispose();
+    etdSerialCtrl.dispose();
+    super.dispose();
+  }
+
+  void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  void _addTable() {
+    final ok = widget.session.addTableSerial(tableCtrl.text);
+    if (!ok) _toast('Bu masa seri no zaten ekli (veya boş).');
+    tableCtrl.clear();
+    widget.onChanged();
+    setState(() {});
+  }
+
+  void _addDesk() {
+    final ok = widget.session.addDeskSerial(deskCtrl.text);
+    if (!ok) _toast('Bu desk seri no zaten ekli (veya boş).');
+    deskCtrl.clear();
+    widget.onChanged();
+    setState(() {});
+  }
+
+  void _addEtd() {
     try {
-      final fs = FirebaseFirestore.instance;
-      final paxSnap = await fs.collection('sessions').doc(widget.sessionId).collection('pax').orderBy('scannedAt').get();
-      final eqSnap = await fs.collection('sessions').doc(widget.sessionId).collection('equipment').get();
-      final perSnap = await fs.collection('sessions').doc(widget.sessionId).collection('personnel').get();
-      final sessionSnap = await fs.collection('sessions').doc(widget.sessionId).get();
-
-      final pax = paxSnap.docs.map(Pax.fromDoc).toList();
-      final dftActive = pax.where((p) => p.status == PaxStatus.active && p.tag == PaxTag.dft).toList();
-      final equipment = eqSnap.docs.map(EquipmentItem.fromDoc).toList();
-      final personnel = perSnap.docs.map(Personnel.fromDoc).toList();
-      final sdata = sessionSnap.data() ?? <String, dynamic>{};
-
-      final excel = xls.Excel.createExcel();
-
-      void writeRow(xls.Sheet sheet, int row, List<String> values) {
-        for (var c = 0; c < values.length; c++) {
-          sheet.updateCell(xls.CellIndex.indexByColumnRow(columnIndex: c, rowIndex: row), xls.TextCellValue(values[c]));
-        }
-      }
-
-      // Sheet: Pax
-      final shPax = excel['PAX'];
-      writeRow(shPax, 0, ['No', 'Name', 'Seat', 'Tag', 'Status', 'Infant', 'ScannedAt']);
-      for (int i = 0; i < pax.length; i++) {
-        final p = pax[i];
-        writeRow(shPax, i + 1, [
-          '${i + 1}',
-          p.fullName,
-          p.seat,
-          p.tag == PaxTag.dft ? 'DFT' : 'PRE',
-          p.status == PaxStatus.active ? 'ACTIVE' : 'OFFLOADED',
-          p.isInfant ? 'YES' : 'NO',
-          p.scannedAt.toString().substring(0, 19),
-        ]);
-      }
-
-      // Sheet: DFT
-      final shDft = excel['DFT'];
-      writeRow(shDft, 0, ['No', 'Name', 'Seat']);
-      for (int i = 0; i < dftActive.length; i++) {
-        final p = dftActive[i];
-        writeRow(shDft, i + 1, ['${i + 1}', p.fullName, p.seat]);
-      }
-
-      // Sheet: Equipment
-      final shEq = excel['EQUIPMENT'];
-      writeRow(shEq, 0, ['Type', 'Model', 'Serials']);
-      for (int i = 0; i < equipment.length; i++) {
-        final e = equipment[i];
-        final model = e.type == EquipmentType.etd
-            ? ((e.etdModel ?? EtdModel.is600) == EtdModel.is600 ? 'IS600' : 'Itemiser 4DX')
-            : '';
-        writeRow(shEq, i + 1, [e.type.name.toUpperCase(), model, e.serials.join(' | ')]);
-      }
-
-      // Sheet: Times
-      final shT = excel['TIMES'];
-      String fmtTs(String key) {
-        final ts = sdata[key] as Timestamp?;
-        return ts?.toDate().toString().substring(0, 19) ?? '';
-      }
-
-      writeRow(shT, 0, ['GateAssign', 'OpStart', 'FirstPax', 'LastPax', 'BoardingFinished', 'OpFinished']);
-      writeRow(shT, 1, [
-        fmtTs('gateAssignAt'),
-        fmtTs('operationStartAt'),
-        fmtTs('firstPaxAt'),
-        fmtTs('lastPaxAt'),
-        fmtTs('boardingFinishedAt'),
-        fmtTs('operationFinishedAt'),
-      ]);
-
-      // Sheet: Personnel + signature columns
-      final shPer = excel['PERSONNEL'];
-      writeRow(shPer, 0, ['No', 'Name', 'Title', 'Signature']);
-      for (int i = 0; i < personnel.length; i++) {
-        final p = personnel[i];
-        writeRow(shPer, i + 1, ['${i + 1}', p.name, p.title, '']);
-      }
-
-      // Remove default sheet if created
-      if (excel.sheets.keys.contains('Sheet1') && excel.sheets.keys.length > 1) {
-        excel.delete('Sheet1');
-      }
-
-      final bytes = excel.encode();
-      if (bytes == null) throw Exception('xlsx encode failed');
-
-      final dir = await getTemporaryDirectory();
-      final fileName = 'GateOps_${widget.flightCode}_${widget.gate}_${DateTime.now().millisecondsSinceEpoch}.xlsx'
-          .replaceAll(' ', '_');
-      final file = File('${dir.path}/$fileName');
-      await file.writeAsBytes(bytes, flush: true);
-
-      if (!context.mounted) return;
-      await Share.shareXFiles([XFile(file.path)], text: 'GateOps Report: ${widget.flightCode} Gate ${widget.gate}');
-
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('XLSX hazir: $fileName')));
+      widget.session.addEtd(EtdDevice(model: etdModel, serialNo: etdSerialCtrl.text));
+      etdSerialCtrl.clear();
+      widget.onChanged();
+      setState(() {});
     } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Export basarisiz.')));
-      }
-    } finally {
-      if (mounted) setState(() => _busy = false);
+      _toast(e.toString());
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: ListView(
-        children: [
-          const SizedBox(height: 6),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(14),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Export', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
-                  const SizedBox(height: 8),
-                  Text('Flight: ${widget.flightCode} • Gate: ${widget.gate}', style: const TextStyle(color: Colors.black54)),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 48,
-                    child: FilledButton.icon(
-                      onPressed: _busy ? null : _exportXlsx,
-                      icon: const Icon(Icons.file_download_rounded),
-                      label: Text(_busy ? 'Hazirlaniyor...' : 'XLSX Export + Share'),
+    final tables = widget.session.tableSerials.toList()..sort();
+    final desks = widget.session.deskSerials.toList()..sort();
+    final etds = widget.session.etdDevices;
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Masa (Serial No)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(child: TextField(controller: tableCtrl, decoration: const InputDecoration(labelText: 'Masa seri no'))),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _addTable, child: const Text('Ekle')),
+              ]),
+              const SizedBox(height: 10),
+              if (tables.isEmpty) const Text('Masa yok.'),
+              ...tables.map((t) => ListTile(
+                    dense: true,
+                    title: Text(t),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete),
+                      onPressed: () {
+                        widget.session.removeTableSerial(t);
+                        widget.onChanged();
+                        setState(() {});
+                      },
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  const Text(
-                    'Dosya telefonda paylasim ekrani ile "Downloads" veya baska bir hedefe kaydedilebilir.\n'
-                    'Not: iOS/Android dosya konumu cihaz politikasina gore degisebilir.',
-                    style: TextStyle(color: Colors.black54),
-                  ),
-                ],
-              ),
-            ),
+                  )),
+            ]),
           ),
-        ],
-      ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Desk (Serial No)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(child: TextField(controller: deskCtrl, decoration: const InputDecoration(labelText: 'Desk seri no'))),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _addDesk, child: const Text('Ekle')),
+              ]),
+              const SizedBox(height: 10),
+              if (desks.isEmpty) const Text('Desk yok.'),
+              ...desks.map((d) => ListTile(
+                    dense: true,
+                    title: Text(d),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete),
+                      onPressed: () {
+                        widget.session.removeDeskSerial(d);
+                        widget.onChanged();
+                        setState(() {});
+                      },
+                    ),
+                  )),
+            ]),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('ETD (Model + Seri No)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              DropdownButtonFormField<EtdModel>(
+                value: etdModel,
+                decoration: const InputDecoration(labelText: 'Model'),
+                items: EtdModel.values.map((m) => DropdownMenuItem(value: m, child: Text(m.label))).toList(),
+                onChanged: (v) => setState(() => etdModel = v ?? EtdModel.is600),
+              ),
+              const SizedBox(height: 10),
+              Row(children: [
+                Expanded(child: TextField(controller: etdSerialCtrl, decoration: const InputDecoration(labelText: 'ETD seri no (zorunlu)'))),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _addEtd, child: const Text('Ekle')),
+              ]),
+              const SizedBox(height: 10),
+              if (etds.isEmpty) const Text('ETD yok.'),
+              ...List.generate(etds.length, (i) {
+                final e = etds[i];
+                return ListTile(
+                  dense: true,
+                  title: Text('${e.model.label} • ${e.serialNo}'),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete),
+                    onPressed: () {
+                      widget.session.removeEtdAt(i);
+                      widget.onChanged();
+                      setState(() {});
+                    },
+                  ),
+                );
+              }),
+            ]),
+          ),
+        ),
+      ],
     );
   }
+}
+
+/* =========================================================
+   Helpers
+========================================================= */
+
+String normalizeFlight(String input) => input.toUpperCase().replaceAll(' ', '').trim();
+
+String normalizeName(String input) {
+  var s = input.trim().toUpperCase();
+
+  const map = {
+    'İ': 'I',
+    'İ': 'I',
+    'Ş': 'S',
+    'Ğ': 'G',
+    'Ü': 'U',
+    'Ö': 'O',
+    'Ç': 'C',
+    'Â': 'A',
+    'Ê': 'E',
+    'Î': 'I',
+    'Ô': 'O',
+    'Û': 'U',
+  };
+  map.forEach((k, v) => s = s.replaceAll(k, v));
+
+  const titles = [' MR', ' MRS', ' MS', ' MISS', ' MSTR', ' DR', ' PROF', ' SIR', ' MADAM', ' CHD', ' INF'];
+  for (final t in titles) {
+    s = s.replaceAll(t, '');
+  }
+
+  s = s.replaceAll('/', ' ');
+  s = s.replaceAll(RegExp(r'[^A-Z0-9 ]'), ' ');
+  s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+  return s;
+}
+
+String _nowHHMM() => _hhmm(DateTime.now());
+
+String _hhmm(DateTime dt) {
+  final h = dt.hour.toString().padLeft(2, '0');
+  final m = dt.minute.toString().padLeft(2, '0');
+  return '$h:$m';
+}
+
+int? _parseHHMM(String s) {
+  final m = RegExp(r'^(\d{2}):(\d{2})$').firstMatch(s.trim());
+  if (m == null) return null;
+  final hh = int.parse(m.group(1)!);
+  final mm = int.parse(m.group(2)!);
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return hh * 60 + mm;
 }
