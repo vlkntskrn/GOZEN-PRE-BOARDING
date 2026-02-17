@@ -28,6 +28,19 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
+
+// ---- Utilities (top-level) ----
+String normalizeFullName(String v) {
+  final up = v.trim().toUpperCase();
+  if (up.isEmpty) return '';
+  // Keep letters/numbers/spaces (incl Turkish chars), collapse spaces.
+  final cleaned = up
+      .replaceAll(RegExp(r'[^A-ZÇĞİÖŞÜ0-9\s]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  return cleaned;
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
@@ -104,44 +117,89 @@ void showOpError(BuildContext context, Object error, [StackTrace? st]) {
 // Theme
 // -------------------------
 
-class GateOpsApp extends StatelessWidget {
+class GateOpsApp extends StatefulWidget {
   const GateOpsApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  State<GateOpsApp> createState() => _GateOpsAppState();
+}
+
+class _GateOpsAppState extends State<GateOpsApp> {
+  final ValueNotifier<ThemeMode> _mode = ValueNotifier(ThemeMode.light);
+
+  ThemeData _lightTheme() {
     const red = Color(0xFFD60F2B);
     const bg = Color(0xFFF7F7F8);
-
-    final theme = ThemeData(
+    return ThemeData(
       useMaterial3: true,
       colorScheme: ColorScheme.fromSeed(seedColor: red, brightness: Brightness.light),
       scaffoldBackgroundColor: bg,
       appBarTheme: const AppBarTheme(centerTitle: true),
-      inputDecorationTheme: InputDecorationTheme(
-        filled: true,
-        fillColor: Colors.white,
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(16)),
-        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: Color(0xFFE6E6EA))),
-        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: red, width: 2)),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-      ),
+      inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder()),
       cardTheme: CardThemeData(
-        color: Colors.white,
         elevation: 0,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20), side: const BorderSide(color: Color(0xFFEAEAF0))),
-        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: Colors.black.withValues(alpha: 15)),
+        ),
       ),
-      snackBarTheme: const SnackBarThemeData(behavior: SnackBarBehavior.floating),
     );
+  }
 
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'GateOps',
-      theme: theme,
-      home: const _AuthGate(),
+  ThemeData _darkTheme() {
+    const red = Color(0xFFD60F2B);
+    const bg = Color(0xFF0F1115);
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: ColorScheme.fromSeed(seedColor: red, brightness: Brightness.dark),
+      scaffoldBackgroundColor: bg,
+      appBarTheme: const AppBarTheme(centerTitle: true),
+      inputDecorationTheme: const InputDecorationTheme(border: OutlineInputBorder()),
+      cardTheme: CardThemeData(
+        elevation: 0,
+        color: const Color(0xFF171A21),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: Colors.white.withValues(alpha: 20)),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ThemeScope(
+      mode: _mode,
+      child: ValueListenableBuilder<ThemeMode>(
+        valueListenable: _mode,
+        builder: (context, mode, _) {
+          return MaterialApp(
+            debugShowCheckedModeBanner: false,
+            title: 'GOZEN PRE-BOARDING',
+            theme: _lightTheme(),
+            darkTheme: _darkTheme(),
+            themeMode: mode,
+            home: const _AuthGate(),
+          );
+        },
+      ),
     );
   }
 }
+
+class ThemeScope extends InheritedWidget {
+  const ThemeScope({super.key, required this.mode, required super.child});
+  final ValueNotifier<ThemeMode> mode;
+
+  static ValueNotifier<ThemeMode> of(BuildContext context) {
+    final scope = context.dependOnInheritedWidgetOfExactType<ThemeScope>();
+    return scope!.mode;
+  }
+
+  @override
+  bool updateShouldNotify(ThemeScope oldWidget) => oldWidget.mode != mode;
+}
+
 
 class _AuthGate extends StatelessWidget {
   const _AuthGate();
@@ -157,7 +215,20 @@ class _AuthGate extends StatelessWidget {
         if (snap.data == null) {
           return const LoginScreen();
         }
-        return const HomeShell();
+        final uid = snap.data!.uid;
+        return FutureBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          future: FirebaseFirestore.instance.collection('users').doc(uid).get(),
+          builder: (context, userSnap) {
+            final night = (userSnap.data?.data()?['nightMode'] ?? false) == true;
+            final mode = ThemeScope.of(context);
+            final desired = night ? ThemeMode.dark : ThemeMode.light;
+            if (mode.value != desired) {
+              // ignore: avoid_setstate_in_build
+              mode.value = desired;
+            }
+            return const HomeShell();
+          },
+        );
       },
     );
   }
@@ -226,6 +297,13 @@ class Pax {
     required this.isInfant,
     required this.scannedAt,
     required this.lastEvent,
+    this.boardedByUid = '',
+    this.boardedAt,
+    this.offloadedByUid = '',
+    this.offloadedAt,
+    this.lastActionByUid = '',
+    this.lastActionAt,
+    this.source = 'scan',
   });
 
   final String id;
@@ -238,7 +316,16 @@ class Pax {
   final PaxStatus status;
   final bool isInfant;
   final DateTime scannedAt;
-  final String lastEvent; // scanned/offloaded/reinstated
+  final String lastEvent; // dft/pre/offloaded/reinstated/manual
+
+  // audit
+  final String boardedByUid;
+  final DateTime? boardedAt;
+  final String offloadedByUid;
+  final DateTime? offloadedAt;
+  final String lastActionByUid;
+  final DateTime? lastActionAt;
+  final String source; // scan/manual
 
   Map<String, dynamic> toMap() {
     return {
@@ -248,10 +335,17 @@ class Pax {
       'givenName': givenName,
       'seat': seat,
       'tag': tag.name,
-      'status': status.name,
+      'status': status == PaxStatus.offloaded ? 'offloaded' : 'active',
       'isInfant': isInfant,
       'scannedAt': Timestamp.fromDate(scannedAt),
       'lastEvent': lastEvent,
+      'boardedByUid': boardedByUid,
+      'boardedAt': boardedAt == null ? null : Timestamp.fromDate(boardedAt!),
+      'offloadedByUid': offloadedByUid,
+      'offloadedAt': offloadedAt == null ? null : Timestamp.fromDate(offloadedAt!),
+      'lastActionByUid': lastActionByUid,
+      'lastActionAt': lastActionAt == null ? null : Timestamp.fromDate(lastActionAt!),
+      'source': source,
       'updatedAt': FieldValue.serverTimestamp(),
     };
   }
@@ -268,11 +362,19 @@ class Pax {
       tag: ((d['tag'] ?? 'dft') as String) == 'pre' ? PaxTag.pre : PaxTag.dft,
       status: ((d['status'] ?? 'active') as String) == 'offloaded' ? PaxStatus.offloaded : PaxStatus.active,
       isInfant: (d['isInfant'] ?? false) as bool,
-      scannedAt: ((d['scannedAt'] as Timestamp?)?.toDate()) ?? DateTime.now(),
-      lastEvent: (d['lastEvent'] ?? 'scanned') as String,
+      scannedAt: ((d['scannedAt'] as Timestamp?)?.toDate()) ?? DateTime.fromMillisecondsSinceEpoch(0),
+      lastEvent: (d['lastEvent'] ?? '') as String,
+      boardedByUid: (d['boardedByUid'] ?? '') as String,
+      boardedAt: ((d['boardedAt'] as Timestamp?)?.toDate()),
+      offloadedByUid: (d['offloadedByUid'] ?? '') as String,
+      offloadedAt: ((d['offloadedAt'] as Timestamp?)?.toDate()),
+      lastActionByUid: (d['lastActionByUid'] ?? '') as String,
+      lastActionAt: ((d['lastActionAt'] as Timestamp?)?.toDate()),
+      source: (d['source'] ?? 'scan') as String,
     );
   }
 }
+
 
 enum EquipmentType { table, desk, etd }
 
@@ -324,6 +426,8 @@ class EquipmentItem {
         final m = (etdModel ?? EtdModel.is600) == EtdModel.is600 ? 'IS600' : 'Itemiser 4DX';
         return 'ETD ($m)';
     }
+    // Unreachable, but keeps analyzer happy for non-nullable return.
+    return type.name;
   }
 }
 
@@ -464,6 +568,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final _username = TextEditingController();
   final _password = TextEditingController();
   bool _busy = false;
+  bool _offlineMode = false;
   bool _obscure = true;
 
   @override
@@ -485,6 +590,16 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _busy = true);
     try {
       await FirebaseAuth.instance.signInWithEmailAndPassword(email: usernameToEmail(username), password: pwd);
+      final uid = FirebaseAuth.instance.currentUser?.uid;
+      if (uid != null) {
+        await FirebaseFirestore.instance.collection('users').doc(uid).set({
+          'displayName': username.trim(),
+          'email': usernameToEmail(username),
+          'nightMode': false,
+          'isAdmin': false,
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
     } on FirebaseAuthException catch (e) {
       _toast(_prettyAuthError(e));
     } catch (_) {
@@ -699,6 +814,7 @@ class _SessionPickerState extends State<_SessionPicker> {
   final _gate = TextEditingController();
   final _booked = TextEditingController(text: '0');
   bool _busy = false;
+  bool _offlineMode = false;
 
   @override
   void dispose() {
@@ -721,17 +837,20 @@ class _SessionPickerState extends State<_SessionPicker> {
     setState(() => _busy = true);
     try {
       final now = DateTime.now();
+      final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
       final sid = '${sanitizeKey(flight)}_${sanitizeKey(gate.isEmpty ? 'G' : gate)}_${now.millisecondsSinceEpoch}';
 
       await FirebaseFirestore.instance.collection('sessions').doc(sid).set({
         'flightCode': flight,
         'gate': gate,
         'bookedPax': booked,
+        'offlinePreferred': _offlineMode,
         'createdAt': FieldValue.serverTimestamp(),
         'createdBy': FirebaseAuth.instance.currentUser!.uid,
         'boardingFinished': false,
       });
 
+      if (_offlineMode) { await FirebaseFirestore.instance.disableNetwork(); }
       widget.onJoined(sid);
     } catch (e) {
       _toast('Session olusturulamadi.');
@@ -747,6 +866,13 @@ class _SessionPickerState extends State<_SessionPicker> {
       if (!doc.exists) {
         _toast('Session bulunamadi.');
         return;
+      }
+      final preferOffline = (doc.data()?['offlinePreferred'] ?? false) == true;
+      if (_offlineMode || preferOffline) {
+        await FirebaseFirestore.instance.disableNetwork();
+      } else {
+        // ensure online
+        try { await FirebaseFirestore.instance.enableNetwork(); } catch (_) {}
       }
       widget.onJoined(sid);
     } finally {
@@ -798,6 +924,13 @@ class _SessionPickerState extends State<_SessionPicker> {
                     keyboardType: TextInputType.number,
                     inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                     decoration: const InputDecoration(labelText: 'Booked Pax', prefixIcon: Icon(Icons.people_alt_rounded)),
+                  ),
+                  SwitchListTile(
+                    value: _offlineMode,
+                    onChanged: (v) => setState(() => _offlineMode = v),
+                    title: const Text('Offline mod'),
+                    subtitle: const Text('İnternet kesilirse kayıtlar cihazda sıraya alınır ve internet gelince senkronize olur.'),
+                    secondary: const Icon(Icons.cloud_off_rounded),
                   ),
                   const SizedBox(height: 12),
                   SizedBox(
@@ -909,6 +1042,7 @@ class _FlightWorkspaceState extends State<FlightWorkspace> {
                 children: [
                   ScanTab(sessionId: widget.sessionId, flightCode: flight, booked: booked),
                   ListsTab(sessionId: widget.sessionId, booked: booked),
+                  WatchlistTab(sessionId: widget.sessionId),
                   EquipmentTab(sessionId: widget.sessionId),
                   PersonnelTab(sessionId: widget.sessionId),
                   TimesTab(sessionId: widget.sessionId),
@@ -981,6 +1115,19 @@ class _WorkspaceHeader extends StatelessWidget {
                   color: boardingFinished ? Colors.black87 : cs.primary,
                 ),
                 const SizedBox(height: 8),
+                IconButton(
+                  tooltip: 'Gece modu',
+                  onPressed: () async {
+                    final mode = ThemeScope.of(context);
+                    final next = mode.value == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+                    mode.value = next;
+                    final uid = FirebaseAuth.instance.currentUser?.uid;
+                    if (uid != null) {
+                      await FirebaseFirestore.instance.collection('users').doc(uid).set({'nightMode': next == ThemeMode.dark}, SetOptions(merge: true));
+                    }
+                  },
+                  icon: const Icon(Icons.dark_mode_rounded),
+                ),
                 OutlinedButton.icon(
                   onPressed: onExit,
                   icon: const Icon(Icons.exit_to_app_rounded),
@@ -1035,6 +1182,7 @@ class _BottomNav extends StatelessWidget {
       destinations: const [
         NavigationDestination(icon: Icon(Icons.qr_code_scanner_rounded), label: 'Scan'),
         NavigationDestination(icon: Icon(Icons.list_alt_rounded), label: 'Lists'),
+        NavigationDestination(icon: Icon(Icons.visibility_rounded), label: 'Watch'),
         NavigationDestination(icon: Icon(Icons.inventory_2_rounded), label: 'Equip'),
         NavigationDestination(icon: Icon(Icons.badge_rounded), label: 'Personnel'),
         NavigationDestination(icon: Icon(Icons.schedule_rounded), label: 'Times'),
@@ -1068,8 +1216,74 @@ class _ScanTabState extends State<ScanTab> {
   bool _busy = false;
   String? _lastRaw;
 
+    Timer? _netTimer;
+  bool _offlineByPrompt = false;
+  bool _promptShowing = false;
+
   @override
+  void initState() {
+    super.initState();
+    // Scan ekranında internet kesilirse 1 dakikada bir offline mod teklif et
+    _netTimer = Timer.periodic(const Duration(minutes: 1), (_) => _checkNetAndOfferOffline());
+    // hızlı ilk kontrol
+    Future.delayed(const Duration(seconds: 3), _checkNetAndOfferOffline);
+  }
+
+  Future<bool> _hasInternet() async {
+    try {
+      final r = await InternetAddress.lookup('example.com');
+      return r.isNotEmpty && r.first.rawAddress.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _checkNetAndOfferOffline() async {
+    if (!mounted) return;
+    if (_offlineByPrompt) {
+      // offline moddayken internet geldi mi?
+      final ok = await _hasInternet();
+      if (ok) {
+        try { await FirebaseFirestore.instance.enableNetwork(); } catch (_) {}
+        if (mounted) {
+          setState(() => _offlineByPrompt = false);
+          _toast('İnternet geldi. Senkronizasyon yapılıyor…');
+        }
+      }
+      return;
+    }
+
+    final ok = await _hasInternet();
+    if (ok) return;
+
+    if (_promptShowing) return;
+    _promptShowing = true;
+
+    final agree = await showDialog<bool>(
+          context: context,
+          builder: (c) => AlertDialog(
+            title: const Text('İnternet yok'),
+            content: const Text('Offline moda geçilsin mi? Offline modda kayıtlar cihazda sıraya alınır ve internet gelince otomatik senkronize olur.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.of(c).pop(false), child: const Text('Hayır')),
+              FilledButton(onPressed: () => Navigator.of(c).pop(true), child: const Text('Evet, Offline')),
+            ],
+          ),
+        ) ??
+        false;
+
+    _promptShowing = false;
+    if (!mounted) return;
+    if (agree) {
+      try { await FirebaseFirestore.instance.disableNetwork(); } catch (_) {}
+      setState(() => _offlineByPrompt = true);
+      _toast('Offline mod aktif.');
+    }
+  }
+
+@override
   void dispose() {
+    _netTimer?.cancel();
     _scanner.dispose();
     super.dispose();
   }
@@ -1129,8 +1343,14 @@ class _ScanTabState extends State<ScanTab> {
       // 4) Save
       await _saveScan(parsed, tag: tag, forceInfant: false);
 
-      _toast('${tag == PaxTag.dft ? 'DFT' : 'Pre'} kaydedildi: ${_normalizeSeat(parsed.seat)}');
-    } on _SeatDuplicateException catch (e) {
+      final matched = await _maybeWatchlistAlert(parsed.fullName);
+      if (!matched) {
+        await _showSuccessScreen(
+          tag == PaxTag.dft ? 'DFT OK' : 'PRE OK',
+          'Seat: ${_normalizeSeat(parsed.seat)}',
+        );
+      }
+} on _SeatDuplicateException catch (e) {
       final proceed = await _confirm(
         'Mükerrer Seat',
         'Bu uçuşta aynı seat (infant hariç) olamaz.\n'
@@ -1225,7 +1445,19 @@ class _ScanTabState extends State<ScanTab> {
     return '$carrier$num';
   }
 
-  String _normalizeSeat(String v) {
+  
+String normalizeFullName(String v) {
+  final up = v.trim().toUpperCase();
+  if (up.isEmpty) return '';
+  // remove diacritics roughly + collapse spaces
+  final cleaned = up
+      .replaceAll(RegExp(r'[^A-ZÇĞİÖŞÜ0-9\s]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  return cleaned;
+}
+
+String _normalizeSeat(String v) {
     var s = v.trim().toUpperCase().replaceAll(' ', '');
     if (s.isEmpty) return '';
     // common: 003A -> 3A
@@ -1287,10 +1519,10 @@ class _ScanTabState extends State<ScanTab> {
     }
 
     // Heuristic parsing for non-BCBP / vendor formats
-    final flightMatch = RegExp(r'''\b([A-Z0-9]{2,3})\s*0?(\d{3,5})\b''').firstMatch(v.toUpperCase());
+    final flightMatch = RegExp(r'\b([A-Z0-9]{2,3})\s*0?(\d{3,5})\b').firstMatch(v.toUpperCase());
     final flightCode = flightMatch == null ? '' : _normalizeFlight('${flightMatch.group(1)}${flightMatch.group(2)}');
 
-    final seatMatch = RegExp(r'''\b(\d{1,3}\s*[A-Z])\b''').firstMatch(v.toUpperCase());
+    final seatMatch = RegExp(r'\b(\d{1,3}\s*[A-Z])\b').firstMatch(v.toUpperCase());
     final seat = seatMatch == null ? '' : _normalizeSeat(seatMatch.group(1)!.replaceAll(' ', ''));
 
     // Name heuristic (very unreliable)
@@ -1510,6 +1742,26 @@ Future<void> _forceAddAsInfant() async {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text('Camera Scan', style: TextStyle(fontWeight: FontWeight.w900)),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _inviteUser,
+                          icon: const Icon(Icons.person_add_alt_1_rounded),
+                          label: const Text('Davet Et'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _offlineByPrompt ? () async { try { await FirebaseFirestore.instance.enableNetwork(); } catch (_) {} setState(() => _offlineByPrompt = false); } : null,
+                          icon: const Icon(Icons.cloud_done_rounded),
+                          label: const Text('Online'),
+                        ),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 10),
                   ClipRRect(
                     borderRadius: BorderRadius.circular(18),
@@ -1672,6 +1924,169 @@ Future<void> _forceAddAsInfant() async {
       ),
     );
   }
+
+  
+  Future<void> _inviteUser() async {
+    final ctl = TextEditingController();
+    try {
+      final name = await showDialog<String>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: const Text('Kullanıcı davet et'),
+          content: TextField(
+            controller: ctl,
+            decoration: const InputDecoration(labelText: 'Kullanıcı adı (login adı)'),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(c).pop(null), child: const Text('İptal')),
+            FilledButton(onPressed: () => Navigator.of(c).pop(ctl.text.trim()), child: const Text('Davet Et')),
+          ],
+        ),
+      );
+
+      final v = (name ?? '').trim();
+      if (v.isEmpty) return;
+
+      final qs = await FirebaseFirestore.instance.collection('users').where('displayName', isEqualTo: v).limit(1).get();
+      if (qs.docs.isEmpty) {
+        _toast('Kullanıcı bulunamadı: $v');
+        return;
+      }
+      final invitedUid = qs.docs.first.id;
+
+      final me = FirebaseAuth.instance.currentUser?.uid ?? '';
+      final sref = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId);
+
+      await FirebaseFirestore.instance.runTransaction((tx) async {
+        final sdoc = await tx.get(sref);
+        final createdBy = (sdoc.data()?['createdByUid'] ?? '') as String;
+        final myUser = await tx.get(FirebaseFirestore.instance.collection('users').doc(me));
+        final isAdmin = (myUser.data()?['isAdmin'] ?? false) == true;
+
+        if (!isAdmin && createdBy != me) {
+          throw Exception('only owner/admin');
+        }
+
+        final allowed = (sdoc.data()?['allowedUids'] as List?)?.cast<String>() ?? <String>[];
+        if (!allowed.contains(invitedUid)) allowed.add(invitedUid);
+
+        tx.set(sref, {'allowedUids': allowed}, SetOptions(merge: true));
+        tx.set(sref.collection('events').doc(), {
+          'type': 'invite',
+          'invitedUid': invitedUid,
+          'invitedName': v,
+          'actorUid': me,
+          'at': FieldValue.serverTimestamp(),
+        });
+      });
+
+      _toast('Davet gönderildi: $v');
+    } catch (e) {
+      _toast('Davet başarısız: $e');
+    } finally {
+      ctl.dispose();
+    }
+  }
+
+Future<bool> _maybeWatchlistAlert(String fullName) async {
+    final norm = normalizeFullName(fullName);
+    if (norm.isEmpty) return false;
+
+    try {
+      final q = await FirebaseFirestore.instance.collection('watchlist').where('fullNameNorm', isEqualTo: norm).limit(1).get();
+      if (q.docs.isEmpty) return false;
+
+      // log
+      try {
+        final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+        await FirebaseFirestore.instance
+            .collection('sessions')
+            .doc(widget.sessionId)
+            .collection('events')
+            .add({
+          'type': 'watchlist_match',
+          'fullName': fullName,
+          'fullNameNorm': norm,
+          'actorUid': uid,
+          'at': FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+
+      if (!mounted) return true;
+
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          fullscreenDialog: true,
+          builder: (_) => Scaffold(
+            backgroundColor: Colors.red.shade800,
+            body: SafeArea(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.warning_rounded, size: 110, color: Colors.white),
+                      const SizedBox(height: 16),
+                      const Text('WATCHLIST MATCH', textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.w900)),
+                      const SizedBox(height: 10),
+                      Text(norm, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 20),
+                      FilledButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        style: FilledButton.styleFrom(backgroundColor: Colors.white),
+                        child: const Text('Kapat', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _showSuccessScreen(String title, String subtitle) async {
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Scaffold(
+          backgroundColor: Colors.green.shade700,
+          body: SafeArea(
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.check_circle_rounded, size: 110, color: Colors.white),
+                    const SizedBox(height: 14),
+                    Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 10),
+                    Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 18),
+                    FilledButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      style: FilledButton.styleFrom(backgroundColor: Colors.white),
+                      child: const Text('OK', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
 }
 
 class _SeatDuplicateException implements Exception {
@@ -1817,6 +2232,61 @@ class _ListsTabState extends State<ListsTab> {
 
   CollectionReference<Map<String, dynamic>> get _paxCol =>
       FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('pax');
+  String _normalizeSeat(String seat) => normalizeSeat(seat);
+
+  DocumentReference<Map<String, dynamic>> _seatLockDoc(String seat) =>
+      FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('seats').doc(seat);
+
+  Future<bool> _confirm(String title, String msg) async {
+    final res = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(msg),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')) ,
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Onay')),
+        ],
+      ),
+    );
+    return res == true;
+  }
+
+  Future<void> _showSuccessScreen(String title, String subtitle) async {
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Scaffold(
+          backgroundColor: Colors.green.shade700,
+          body: SafeArea(
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.check_circle_rounded, size: 110, color: Colors.white),
+                    const SizedBox(height: 14),
+                    Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 34, fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 10),
+                    Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 18),
+                    FilledButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      style: FilledButton.styleFrom(backgroundColor: Colors.white),
+                      child: const Text('OK', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800)),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
 
   Stream<bool> _boardingFinishedStream() {
     return FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).snapshots().map((d) {
@@ -1962,13 +2432,147 @@ class _ListsTabState extends State<ListsTab> {
   }
 
   Future<void> _offloadPax(Pax p) async {
+    final normSeat = _normalizeSeat(p.seat);
     final paxRef = _paxCol.doc(p.id);
-    await paxRef.set({'status': 'offloaded', 'lastEvent': 'offloaded', 'updatedAt': FieldValue.serverTimestamp()}, SetOptions(merge: true));
-    // clear seat lock if held
-    if (!p.isInfant) {
-      final seatRef = FirebaseFirestore.instance.collection('sessions').doc(widget.sessionId).collection('seats').doc(p.seat);
-      await seatRef.set({'active': false, 'activePaxId': '', 'updatedAt': FieldValue.serverTimestamp()}, SetOptions(merge: true));
+    final seatRef = _seatLockDoc(normSeat);
+
+    final ok = await _confirm('Offload', '${p.fullName} ($normSeat) offload?');
+    if (!ok) return;
+
+    final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    final now = DateTime.now();
+
+    await FirebaseFirestore.instance.runTransaction((tx) async {
+      tx.set(
+        paxRef,
+        {
+          'status': 'offloaded',
+          'lastEvent': 'offloaded',
+          'offloadedByUid': uid,
+          'offloadedAt': Timestamp.fromDate(now),
+          'lastActionByUid': uid,
+          'lastActionAt': Timestamp.fromDate(now),
+          'updatedAt': FieldValue.serverTimestamp(),
+        },
+        SetOptions(merge: true),
+      );
+
+      // Seat lock kaldır: offload sonrası tekrar board mümkün olsun
+      tx.delete(seatRef);
+    });
+
+    if (mounted) {
+      await _showSuccessScreen('OFFLOAD OK', 'Seat: $normSeat');
     }
+  }
+}
+
+
+// -------------------------
+// Watchlist Tab
+// -------------------------
+
+class WatchlistTab extends StatefulWidget {
+  const WatchlistTab({super.key, required this.sessionId});
+  final String sessionId;
+
+  @override
+  State<WatchlistTab> createState() => _WatchlistTabState();
+}
+
+class _WatchlistTabState extends State<WatchlistTab> {
+  final _name = TextEditingController();
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  void _toast(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+
+  Future<void> _add() async {
+    final full = _name.text.trim();
+    if (full.isEmpty) return;
+    final norm = normalizeFullName(full);
+    if (norm.isEmpty) return;
+
+    final uid = FirebaseAuth.instance.currentUser?.uid ?? '';
+    await FirebaseFirestore.instance.collection('watchlist').add({
+      'fullName': full,
+      'fullNameNorm': norm,
+      'createdByUid': uid,
+      'createdAt': FieldValue.serverTimestamp(),
+    });
+    _name.clear();
+    _toast('Watchlist eklendi');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Watchlist', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _name,
+                    decoration: const InputDecoration(
+                      labelText: 'Ad Soyad',
+                      hintText: 'Örn: JOHN DOE',
+                      prefixIcon: Icon(Icons.person_search_rounded),
+                    ),
+                    onSubmitted: (_) => _add(),
+                  ),
+                  const SizedBox(height: 10),
+                  FilledButton.icon(
+                    onPressed: _add,
+                    icon: const Icon(Icons.add_rounded),
+                    label: const Text('Ekle'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          const Text('Kayıtlar', style: TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: FirebaseFirestore.instance.collection('watchlist').orderBy('createdAt', descending: true).limit(200).snapshots(),
+            builder: (context, snap) {
+              final docs = snap.data?.docs ?? const [];
+              if (docs.isEmpty) {
+                return const Card(child: Padding(padding: EdgeInsets.all(16), child: Text('Henüz watchlist kaydı yok.')));
+              }
+              return Column(
+                children: [
+                  for (final d in docs)
+                    Card(
+                      child: ListTile(
+                        leading: const Icon(Icons.visibility_rounded),
+                        title: Text((d.data()['fullName'] ?? '') as String),
+                        subtitle: Text((d.data()['fullNameNorm'] ?? '') as String, style: const TextStyle(color: Colors.black54)),
+                        trailing: IconButton(
+                          tooltip: 'Sil',
+                          icon: const Icon(Icons.delete_outline_rounded),
+                          onPressed: () => d.reference.delete(),
+                        ),
+                      ),
+                    )
+                ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -2093,7 +2697,7 @@ class _EquipmentDialogState extends State<_EquipmentDialog> {
           children: [
             DropdownButtonFormField<EquipmentType>(
               value: type,
-              items: const [
+              items: [
                 DropdownMenuItem(value: EquipmentType.table, child: Text('Masa')),
                 DropdownMenuItem(value: EquipmentType.desk, child: Text('Desk')),
                 DropdownMenuItem(value: EquipmentType.etd, child: Text('ETD')),
@@ -2105,7 +2709,7 @@ class _EquipmentDialogState extends State<_EquipmentDialog> {
             if (type == EquipmentType.etd)
               DropdownButtonFormField<EtdModel>(
                 value: etdModel,
-                items: const [
+                items: [
                   DropdownMenuItem(value: EtdModel.is600, child: Text('IS600')),
                   DropdownMenuItem(value: EtdModel.itemiser4dx, child: Text('Itemiser 4DX')),
                 ],
